@@ -2,7 +2,7 @@
 ### Transformer-Based Latent GAN for Authorial Text Generation 
 
 <!-- Task -->
-## Roadmap
+## Task
 
 - [ ] 
 - [ ] 
