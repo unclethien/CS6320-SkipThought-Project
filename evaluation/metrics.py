@@ -2,12 +2,14 @@ from typing import List, Dict, Tuple
 from collections import Counter
 import nltk
 from nltk.util import ngrams
+import numpy as np
+import torch
+from utils.decoding import generate_sequence
+
 # Consider using libraries like sacrebleu for more standardized BLEU
 # from sacrebleu.metrics import BLEU
 # Or Hugging Face datasets library
 # import datasets
-import numpy as np
-import torch
 
 # Ensure NLTK data is available (run nltk.download('punkt') once if needed)
 try:
@@ -164,12 +166,11 @@ def calculate_standard_metrics(hypotheses: List[str], references_list: List[List
     return results
 
 
-def evaluate_model(generator, encoder, dataloader, eval_config, device, tokenizer):
+def evaluate_model(generator, dataloader, eval_config, device, tokenizer):
     """Evaluates the model on a dataset using specified metrics.
 
     Args:
         generator: The trained Generator model.
-        encoder: The trained Encoder model.
         dataloader: DataLoader for the evaluation dataset.
         eval_config: Dictionary containing evaluation parameters (metrics, decoding settings).
         device: The device to run evaluation on ('cuda' or 'cpu').
@@ -179,7 +180,6 @@ def evaluate_model(generator, encoder, dataloader, eval_config, device, tokenize
         Dictionary containing calculated metric scores.
     """
     generator.eval()
-    encoder.eval()
 
     all_hypotheses_str = []       # List of generated sentences (strings)
     all_references_str = []       # List of lists of reference sentences (strings)
@@ -191,26 +191,22 @@ def evaluate_model(generator, encoder, dataloader, eval_config, device, tokenize
     with torch.no_grad():
         progress_bar = tqdm(dataloader, desc="Evaluating")
         for batch in progress_bar:
-            # TODO: Adapt batch loading
-            source_tokens = batch['source_tokens'].to(device)
-            source_embedding = batch['source_embedding'].to(device)
-            references = batch['references'] # List of reference strings for each source
-            batch_size = source_embedding.size(0)
+            # Batch loading: source tokens and references
+            source_tokens = batch['source_tokens'].to(device)  # [batch, seq_len]
+            references = batch['references']  # List[List[str]]
+            batch_size = source_tokens.size(0)
 
-            # Encode source
-            z_enc, _, _ = encoder(source_embedding)
+            # Compute memory by embedding source tokens and mean pooling
+            # src_emb: [batch, seq_len, embed_dim]
+            src_emb = generator.embedding(source_tokens)
+            memory = src_emb.mean(dim=1)  # [batch, embed_dim]
 
-            # Generate paraphrases (Beam search or sampling)
-            # TODO: Implement generation loop using utils.decoding
-            # This needs a proper generation function that takes the model, input, tokenizer
-            # and decoding params (top-k, top-p, temp, max_len, beam_size) -> outputs token IDs
-            generated_ids_batch = [] # Placeholder: batch of lists of token IDs
+            # Generate paraphrase token IDs per sample
+            generated_ids_batch = []
             for i in range(batch_size):
-                 # Simplified placeholder: generate one sequence per input
-                 # Replace with actual call to generation function from utils.decoding
-                 # Example: generated_ids = generate_sequence(generator, z_enc[i:i+1], tokenizer, ...) 
-                 generated_ids = [tokenizer.cls_token_id, 101, 102, tokenizer.sep_token_id] # Dummy output
-                 generated_ids_batch.append(generated_ids)
+                mem = memory[i:i+1]  # [1, embed_dim]
+                gen_ids = generate_sequence(generator, mem, tokenizer, decoding_params, device)
+                generated_ids_batch.append(gen_ids)
 
             # Decode generated IDs to strings and tokens
             for gen_ids in generated_ids_batch:
@@ -245,5 +241,4 @@ def evaluate_model(generator, encoder, dataloader, eval_config, device, tokenize
     final_results = {k: v for k, v in results.items() if k in metrics_to_compute}
 
     generator.train() # Set back to train mode
-    encoder.train()
     return final_results

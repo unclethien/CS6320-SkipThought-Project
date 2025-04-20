@@ -1,0 +1,10 @@
+# Ignore generated results, including model checkpoints
+results/
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+
+# Ignore virtual environment directory
+.venv/

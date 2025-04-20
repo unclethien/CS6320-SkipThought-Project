@@ -1,12 +1,15 @@
 from torch.utils.data import Dataset, DataLoader
 import torch
-
-# Placeholder imports - replace with actual tokenizer library
+import os
 from transformers import AutoTokenizer
+from datasets import load_dataset
+import logging
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 def get_tokenizer(tokenizer_name='bert-base-uncased'):
     """Loads a tokenizer."""
-    # In a real scenario, you might load from a file or use Hugging Face's AutoTokenizer
     try:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         return tokenizer
@@ -46,56 +49,91 @@ def get_tokenizer(tokenizer_name='bert-base-uncased'):
         print("Using a fallback simple tokenizer.")
         return SimpleTokenizer()
 
-class PlaceholderDataset(Dataset):
-    """A placeholder dataset returning dummy data."""
-    def __init__(self, num_samples=1000, max_seq_len=50, embed_dim=768, latent_dim=256, discrete_classes=10):
-        self.num_samples = num_samples
-        self.max_seq_len = max_seq_len
-        self.embed_dim = embed_dim
-        self.latent_dim = latent_dim # Should match encoder output
-        self.discrete_classes = discrete_classes
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, idx):
-        # Return dummy data matching expected types/shapes
-        # Replace with actual data loading and tokenization
-        dummy_tokens = torch.randint(0, 1000, (self.max_seq_len,), dtype=torch.long)
-        dummy_padding_mask = (dummy_tokens == 0) # Example padding mask
-        dummy_embedding = torch.randn(self.embed_dim)
-        dummy_target_embedding = torch.randn(self.embed_dim)
-        discrete_code = torch.randint(0, self.discrete_classes, (1,), dtype=torch.long).squeeze()
-        continuous_code = torch.randn(2) # Example: 2 continuous codes
-
-        return {
-            'source_tokens': dummy_tokens, # Example: Raw token IDs for source
-            'target_tokens': dummy_tokens, # Example: Raw token IDs for target (teacher forcing)
-            'target_padding_mask': dummy_padding_mask, # Mask for target sequence
-            'source_embedding': dummy_embedding, # Precomputed or derived embedding
-            'target_embedding': dummy_target_embedding, # Precomputed or derived embedding for target
-            'discrete_code': discrete_code,
-            'continuous_code': continuous_code,
-            'references': [f"Reference sentence {idx} one.", f"Reference sentence {idx} two."] # List of ref strings
-        }
-
-def load_data(data_config, tokenizer):
-    """Placeholder function to load data and create DataLoaders."""
+def load_bookcorpus_dataset(data_config, tokenizer):
+    """Loads and prepares the BookCorpus dataset for language modeling."""
+    dataset_name = data_config.get('dataset_name', 'bookcorpus')
     batch_size = data_config.get('batch_size', 32)
-    embed_dim = data_config.get('embed_dim', 768)
-    max_seq_len = data_config.get('max_seq_len', 100)
-    # These should come from model config ideally
-    latent_dim = data_config.get('latent_dim', 256) 
-    discrete_classes = data_config.get('discrete_classes', 10)
-    
-    # Replace with actual dataset loading (e.g., reading files, tokenizing)
-    train_dataset = PlaceholderDataset(num_samples=100, max_seq_len=max_seq_len, embed_dim=embed_dim, latent_dim=latent_dim, discrete_classes=discrete_classes)
-    val_dataset = PlaceholderDataset(num_samples=20, max_seq_len=max_seq_len, embed_dim=embed_dim, latent_dim=latent_dim, discrete_classes=discrete_classes)
-    test_dataset = PlaceholderDataset(num_samples=20, max_seq_len=max_seq_len, embed_dim=embed_dim, latent_dim=latent_dim, discrete_classes=discrete_classes)
+    max_length = data_config.get('params', {}).get('max_length', 128) # Default LM sequence length
+    validation_split_percentage = data_config.get('validation_split', 0.05) # Use 5% for validation
 
-    # Create DataLoaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    logger.info(f"Loading dataset '{dataset_name}' from Hugging Face Hub...")
+    try:
+        # Note: BookCorpus might require manual download/setup or specific access.
+        # Using 'wikitext' as a more accessible alternative if bookcorpus fails.
+        # Replace 'wikitext', 'wikitext-2-raw-v1' with 'bookcorpus' if you have access.
+        raw_datasets = load_dataset('wikitext', 'wikitext-2-raw-v1')
+        # raw_datasets = load_dataset(dataset_name)
+        logger.info(f"Dataset loaded: {raw_datasets}")
+    except Exception as e:
+        logger.error(f"Failed to load dataset '{dataset_name}': {e}")
+        logger.error("Please ensure the dataset exists and you have the necessary permissions/setup.")
+        logger.error("Check https://huggingface.co/datasets/bookcorpus for details.")
+        raise
+
+    # --- Tokenization --- 
+    def tokenize_function(examples):
+        # Tokenize the text. This returns dict {'input_ids': ..., 'attention_mask': ...}
+        return tokenizer(examples['text'], truncation=False) # Don't truncate yet
+
+    logger.info("Tokenizing dataset...")
+    tokenized_datasets = raw_datasets.map(tokenize_function, batched=True, remove_columns=['text'])
+    logger.info(f"Tokenization complete: {tokenized_datasets}")
+
+    # --- Chunking --- 
+    # Main data processing function that will concatenate all texts from our dataset 
+    # and generate chunks of max_seq_length.
+    def group_texts(examples):
+        # Concatenate all texts.
+        concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
+        total_length = len(concatenated_examples[list(examples.keys())[0]])
+        # We drop the small remainder, we could add padding if the model supported it instead of this drop,
+        # you can customize this part to your needs.
+        total_length = (total_length // max_length) * max_length
+        # Split by chunks of max_len.
+        result = {
+            k: [t[i : i + max_length] for i in range(0, total_length, max_length)]
+            for k, t in concatenated_examples.items()
+        }
+        # Create labels (for language modeling, labels are the same as inputs shifted)
+        # Note: The trainer will likely handle the shifting, so we just copy input_ids
+        result["labels"] = result["input_ids"].copy()
+        return result
+
+    logger.info(f"Chunking dataset into sequences of max length {max_length}...")
+    lm_datasets = tokenized_datasets.map(group_texts, batched=True)
+    logger.info(f"Chunking complete: {lm_datasets}")
+
+    # --- Splitting (if necessary) ---
+    if 'validation' not in lm_datasets:
+        logger.info(f"No 'validation' split found. Splitting 'train' into train/validation ({1-validation_split_percentage:.0%}/{validation_split_percentage:.0%}).")
+        # Careful: split_dataset() might be slow for large datasets
+        split_datasets = lm_datasets['train'].train_test_split(test_size=validation_split_percentage, seed=data_config.get('seed', 42))
+        train_ds = split_datasets['train']
+        val_ds = split_datasets['test']
+        # Use validation split also for test split if no test split exists
+        test_ds = val_ds 
+        logger.info(f"Splitting complete: train={len(train_ds)}, validation={len(val_ds)}, test={len(test_ds)}")
+    else:
+        train_ds = lm_datasets['train']
+        val_ds = lm_datasets['validation']
+        test_ds = lm_datasets.get('test', val_ds) # Use validation if test doesn't exist
+        logger.info(f"Using existing splits: train={len(train_ds)}, validation={len(val_ds)}, test={len(test_ds)}")
+
+    # --- DataLoaders --- 
+    # The datasets library handles collation automatically if format is set
+    # lm_datasets.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
+    
+    # Need a custom collate function if not using set_format or if specific padding is needed
+    # For standard LM, HuggingFace Trainer often handles this, but DataLoader needs it. 
+    from transformers import default_data_collator
+    
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=default_data_collator)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=default_data_collator)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=default_data_collator)
+
+    logger.info(f"DataLoaders created: train batches={len(train_loader)}, val batches={len(val_loader)}, test batches={len(test_loader)}")
 
     return train_loader, val_loader, test_loader
+ # def load_data(data_config, tokenizer):
+ #     """Loads real paraphrase data and creates DataLoaders."""
+ #     logger = logging.getLogger(__name__)

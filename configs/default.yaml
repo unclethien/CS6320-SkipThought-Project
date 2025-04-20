@@ -4,7 +4,7 @@ seed: 42
 output_dir: results/default_run
 
 data:
-  path: "./Data/" # Path to dataset directory
+  path: "./data" # Directory containing train_processed.txt, train_processed_val.txt
   # params for dataset class (e.g., max_length)
   params:
     max_length: 50
@@ -51,8 +51,8 @@ training:
   # Early stopping
   early_stopping_patience: 5
   # Curriculum learning params (if used)
-  # initial_real_embed_prob: 1.0
-  # final_real_embed_prob: 0.0
+  initial_real_embed_prob: 1.0
+  final_real_embed_prob: 0.0
 
 evaluation:
   metrics: ['BLEU-4', 'METEOR', 'ROUGE-L', 'Self-BLEU', 'Distinct-1', 'Distinct-2']

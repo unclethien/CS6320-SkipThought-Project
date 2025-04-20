@@ -80,13 +80,38 @@ def sample_with_topk_topp(logits, top_k=0, top_p=0.0, temperature=1.0):
 
     return token_id.item()
 
-# Placeholder for other decoding functions (e.g., beam search)
-# def beam_search_decode(...):
-#     pass
+def generate_sequence(generator, memory, tokenizer, decoding_config: dict, device):
+    """Generates token IDs using the generator and decoding settings."""
+    method = decoding_config.get('method', 'greedy')
+    max_length = decoding_config.get('max_length', 50)
+    top_k = decoding_config.get('top_k', 0)
+    top_p = decoding_config.get('top_p', 0.0)
+    temperature = decoding_config.get('temperature', 1.0)
+    # Initialize input IDs with CLS token
+    cls_id = getattr(tokenizer, 'cls_token_id', None)
+    sep_id = getattr(tokenizer, 'sep_token_id', None)
+    if cls_id is None and hasattr(tokenizer, 'convert_tokens_to_ids'):
+        cls_id = tokenizer.convert_tokens_to_ids('[CLS]')
+    if sep_id is None and hasattr(tokenizer, 'convert_tokens_to_ids'):
+        sep_id = tokenizer.convert_tokens_to_ids('[SEP]')
+    # Start sequence: [cls]
+    input_ids = torch.tensor([[cls_id]], dtype=torch.long, device=device)  # [seq_len=1, batch=1]
+    generated = []
+    for _ in range(max_length):
+        # Create mask
+        tgt_mask = generator._generate_square_subsequent_mask(input_ids.size(0)).to(device)
+        # Get logits: [seq_len, batch, vocab_size]
+        logits = generator(memory, input_ids, tgt_mask=tgt_mask)
+        next_logits = logits[-1, 0]  # [vocab_size]
+        if method == 'greedy':
+            next_id = int(torch.argmax(next_logits).item())
+        else:
+            next_id = sample_with_topk_topp(next_logits, top_k=top_k, top_p=top_p, temperature=temperature)
+        # Append and continue
+        input_ids = torch.cat([input_ids, torch.tensor([[next_id]], device=device)], dim=0)
+        generated.append(next_id)
+        if sep_id is not None and next_id == sep_id:
+            break
+    return generated
 
-# Placeholder for a generation wrapper function
-# def generate_sequence(model, input_embedding, tokenizer, max_len=50, decoding_config=None):
-#     if decoding_config is None:
-#         decoding_config = {}
-#     # ... generation loop using sample_with_topk_topp or beam_search ...
-#     pass
+# EOF: Added generate_sequence
