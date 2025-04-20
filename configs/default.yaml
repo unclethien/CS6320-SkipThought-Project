@@ -1,0 +1,66 @@
+# Default Configuration for Paraphrase GAN
+
+seed: 42
+output_dir: results/default_run
+
+data:
+  path: "./Data/" # Path to dataset directory
+  # params for dataset class (e.g., max_length)
+  params:
+    max_length: 50
+
+model:
+  encoder:
+    # VAEEncoder params (e.g., input_dim depends on sentence embedding)
+    input_dim: 768 # Example: BERT base embedding size
+    hidden_dim: 512
+    latent_dim: 256
+  generator:
+    # Generator params (Transformer Decoder)
+    embed_dim: 256 # Should match encoder's latent_dim or have projection
+    hidden_dim: 1024 # Feedforward hidden dim
+    vocab_size: 30522 # Example: BertTokenizer vocab size
+    num_layers: 3 # Deeper generator
+    # Add other params like nhead, dropout
+  discriminator:
+    # InfoGAN_Discriminator params
+    input_dim: 512 # Example: latent_dim + generator_output_feature_dim
+    hidden_dim: 512
+    disc_code_dim: 10 # Example: 10 discrete categories
+    cont_code_dim: 2  # Example: 2 continuous codes
+    # Minibatch discrimination params inside discriminator if needed
+    mbd_out_features: 50
+    mbd_kernel_dim: 10
+
+training:
+  batch_size: 32
+  num_epochs: 50
+  learning_rate_g: 0.0001
+  learning_rate_d: 0.0001
+  learning_rate_q: 0.0001 # For InfoGAN Q-network
+  optimizer: AdamW # Or Adam
+  # WGAN-GP params
+  wgan_lambda_gp: 10
+  critic_iterations: 5 # Train critic more often than generator
+  # VAE KL loss weight
+  kl_loss_weight: 1.0
+  # InfoGAN loss weight
+  info_loss_weight: 1.0
+  # Mixed precision
+  use_amp: true
+  # Early stopping
+  early_stopping_patience: 5
+  # Curriculum learning params (if used)
+  # initial_real_embed_prob: 1.0
+  # final_real_embed_prob: 0.0
+
+evaluation:
+  metrics: ['BLEU-4', 'METEOR', 'ROUGE-L', 'Self-BLEU', 'Distinct-1', 'Distinct-2']
+  # Decoding params for generation during evaluation/inference
+  decoding:
+    method: 'nucleus' # 'greedy', 'beam', 'topk', 'nucleus'
+    temperature: 1.0
+    top_k: 50
+    top_p: 0.9
+    beam_size: 5 # If using beam search
+    max_length: 50

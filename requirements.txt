@@ -1,0 +1,11 @@
+torch>=1.10.0
+numpy>=1.19.0
+PyYAML>=5.4
+tqdm>=4.60.0
+nltk>=3.6.0
+# For evaluation metrics
+rouge-score>=0.0.4
+# For tokenizer (replace 'bert-base-uncased' example if needed)
+transformers>=4.10.0
+# Optional, but recommended for standardized BLEU:
+# sacrebleu>=2.0.0
