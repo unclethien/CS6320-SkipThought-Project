@@ -5,7 +5,13 @@ tqdm>=4.60.0
 nltk>=3.6.0
 # For evaluation metrics
 rouge-score>=0.0.4
+evaluate>=0.4.0  # Hugging Face evaluate library
+protobuf         # Often needed by evaluate metrics
 # For tokenizer (replace 'bert-base-uncased' example if needed)
 transformers>=4.10.0
+# For Sentence Encoder
+sentence-transformers>=2.0.0 
 # Optional, but recommended for standardized BLEU:
-# sacrebleu>=2.0.0
+sacrebleu>=2.0.0
+# For TensorBoard logging
+tensorboard>=2.5.0
