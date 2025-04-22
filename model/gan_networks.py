@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.nn.utils import spectral_norm
 import logging
 
 logger = logging.getLogger(__name__)
@@ -56,7 +57,7 @@ class LatentDiscriminator(nn.Module):
         layers = []
         input_d = latent_dim
         for h_dim in hidden_dims:
-            layers.append(nn.Linear(input_d, h_dim))
+            layers.append(spectral_norm(nn.Linear(input_d, h_dim)))
             layers.append(nn.LeakyReLU(0.2, inplace=True))
             # LayerNorm or Dropout could be added here
             # layers.append(nn.LayerNorm(h_dim))
@@ -64,7 +65,7 @@ class LatentDiscriminator(nn.Module):
             input_d = h_dim
             
         # Output layer (scalar score)
-        layers.append(nn.Linear(input_d, 1))
+        layers.append(spectral_norm(nn.Linear(input_d, 1)))
         # No activation function for WGAN discriminator output
         
         self.model = nn.Sequential(*layers)

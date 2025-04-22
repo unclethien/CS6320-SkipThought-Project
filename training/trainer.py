@@ -4,6 +4,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.amp import GradScaler, autocast
 import torch.autograd as autograd
+import torch.nn.functional as F
 
 import logging
 import os
@@ -13,6 +14,7 @@ from tqdm.auto import tqdm
 import yaml
 import evaluate # Hugging Face evaluate
 from transformers import AutoTokenizer # Needed for Decoder
+from transformers import get_cosine_schedule_with_warmup
 import nltk
 from nltk.util import ngrams
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction # Added for Self-BLEU
@@ -189,8 +191,25 @@ class Trainer:
         self.optimizer_d = optim.Adam(self.discriminator.parameters(), lr=lr_d, betas=betas_d)
         logger.info(f"Optimizers initialized: G (lr={lr_g}, betas={betas_g}), D (lr={lr_d}, betas={betas_d})")
         
-        # Optional: Optimizer for Autoencoder (Encoder + Decoder) if training end-to-end
-        # self.optimizer_ae = ... 
+        # Autoencoder optimizer and reconstruction criterion
+        lr_ae = float(optimizer_config.get('lr_ae', 0.0))
+        betas_ae = tuple(optimizer_config.get('betas_ae', [0.9, 0.999]))
+        self.criterion_recon = nn.CrossEntropyLoss(ignore_index=self.pad_token_id)
+        self.optimizer_ae = optim.Adam(
+            list(filter(lambda p: p.requires_grad, self.encoder.parameters())) + list(self.decoder.parameters()),
+            lr=lr_ae,
+            betas=betas_ae
+        )
+        logger.info(f"Optimizer AE initialized: lr={lr_ae}, betas={betas_ae}")
+        # --- Learning Rate Schedulers ---
+        num_epochs = self.config['training'].get('num_epochs', 10)
+        num_training_steps = num_epochs * len(self.train_loader)
+        warmup_ratio = optimizer_config.get('warmup_ratio', 0.1)
+        num_warmup_steps = int(warmup_ratio * num_training_steps)
+        self.scheduler_g = get_cosine_schedule_with_warmup(self.optimizer_g, num_warmup_steps, num_training_steps)
+        self.scheduler_d = get_cosine_schedule_with_warmup(self.optimizer_d, num_warmup_steps, num_training_steps)
+        self.scheduler_ae = get_cosine_schedule_with_warmup(self.optimizer_ae, num_warmup_steps, num_training_steps) if lr_ae > 0 else None
+        logger.info(f"Schedulers initialized: warmup_steps={num_warmup_steps}, total_steps={num_training_steps}")
 
         # --- Training State --- 
         self.start_epoch = 0
@@ -229,6 +248,10 @@ class Trainer:
         # --- Load Checkpoint (Optional) ---
         # checkpoint_path = self.config.get('load_checkpoint')
 
+        self.best_metric_value = -1.0 # Initialize best metric score (assuming higher is better, e.g., BLEU)
+        self.best_metric_name = self.config.get('evaluation', {}).get('best_metric', 'BLEU-4')
+        logger.info(f"Tracking best model based on validation metric: {self.best_metric_name}")
+
     def _compute_gradient_penalty(self, real_samples: torch.Tensor, fake_samples: torch.Tensor) -> torch.Tensor:
         """Calculates the gradient penalty loss for WGAN GP"""
         # Random weight term for interpolation between real and fake samples
@@ -257,10 +280,18 @@ class Trainer:
         """Runs a single training epoch for the WGAN-GP."""
         self.generator.train()
         self.discriminator.train()
-        # Set encoder/decoder train/eval mode depending on if they are trained
-        self.encoder.eval() # Assume frozen encoder for now
-        self.decoder.eval() # Assume decoder is not trained here (only for eval)
-        
+        # Encoder/Decoder mode for autoencoder training
+        if self.config['model']['encoder'].get('trainable', False):
+            self.encoder.train()
+        else:
+            self.encoder.eval()
+        if self.config['training'].get('lambda_reconstruction', 0) > 0:
+            self.decoder.train()
+        else:
+            self.decoder.eval()
+        # Track reconstruction loss
+        total_recon_loss = 0.0
+
         total_d_loss = 0.0
         total_g_loss = 0.0
         total_gp = 0.0
@@ -290,16 +321,18 @@ class Trainer:
                 with torch.no_grad(): # Don't track gradients for G when training D
                      fake_latents = self.generator(z).detach() 
                 
-                with torch.amp.autocast('cuda', enabled=self.use_amp): # New API
+                with autocast('cuda', enabled=self.use_amp): # New API
                     # Get scores for real and fake latents
                     real_scores = self.discriminator(real_latents)
                     fake_scores = self.discriminator(fake_latents)
 
-                    # Calculate Gradient Penalty
+                    # Gradient Penalty
                     gradient_penalty = self._compute_gradient_penalty(real_latents.data, fake_latents.data)
-                    
-                    # Calculate WGAN-GP Discriminator Loss
-                    d_loss = fake_scores.mean() - real_scores.mean() + self.lambda_gp * gradient_penalty
+
+                    # Hinge GAN discriminator loss
+                    d_loss_real = F.relu(1.0 - real_scores).mean()
+                    d_loss_fake = F.relu(1.0 + fake_scores).mean()
+                    d_loss = d_loss_real + d_loss_fake + self.lambda_gp * gradient_penalty
 
                 # Backward pass and optimization step for Discriminator
                 self.scaler.scale(d_loss / self.n_critic).backward() # Accumulate gradients
@@ -307,6 +340,8 @@ class Trainer:
                 total_gp += gradient_penalty.item() / self.n_critic
 
             self.scaler.step(self.optimizer_d)
+            if self.scheduler_d:
+                self.scheduler_d.step()
             self.scaler.update()
             self.optimizer_d.zero_grad() # Zero grad again just in case
 
@@ -320,7 +355,7 @@ class Trainer:
             z = torch.randn(batch_size, self.noise_dim, device=self.device) # Use noise_dim
             fake_latents_for_g = self.generator(z)
             
-            with torch.amp.autocast('cuda', enabled=self.use_amp): # New API
+            with autocast('cuda', enabled=self.use_amp): # New API
                 # Get discriminator score for fake latents
                 fake_scores_for_g = self.discriminator(fake_latents_for_g)
                 # Calculate Generator Loss (maximize D score for fakes -> minimize -D score)
@@ -329,8 +364,38 @@ class Trainer:
             # Backward pass and optimization step for Generator
             self.scaler.scale(g_loss).backward()
             self.scaler.step(self.optimizer_g)
+            if self.scheduler_g:
+                self.scheduler_g.step()
             self.scaler.update()
             total_g_loss += g_loss.item()
+
+            # === Autoencoder reconstruction step ===
+            lambda_recon = self.config['training'].get('lambda_reconstruction', 0.0)
+            if lambda_recon > 0:
+                self.optimizer_ae.zero_grad()
+                encoding = self.tokenizer(
+                    real_texts,
+                    padding='max_length',
+                    truncation=True,
+                    max_length=self.config['data'].get('max_seq_length'),
+                    return_tensors='pt'
+                ).to(self.device)
+                input_ids = encoding.input_ids
+                decoder_input = input_ids[:, :-1]
+                decoder_target = input_ids[:, 1:]
+                with autocast('cuda', enabled=self.use_amp):
+                    latents_recon = self.encoder(real_texts)
+                    logits = self.decoder(latents_recon, decoder_input)
+                    loss_recon = self.criterion_recon(
+                        logits.reshape(-1, self.vocab_size), decoder_target.reshape(-1)
+                    )
+                    loss_recon = lambda_recon * loss_recon
+                self.scaler.scale(loss_recon).backward()
+                self.scaler.step(self.optimizer_ae)
+                if self.scheduler_ae:
+                    self.scheduler_ae.step()
+                self.scaler.update()
+                total_recon_loss += loss_recon.item()
 
             # --- Logging --- 
             self.global_step += 1
@@ -338,28 +403,74 @@ class Trainer:
                  pbar.set_postfix({
                      'D Loss': f'{d_loss.item():.4f}',
                      'G Loss': f'{g_loss.item():.4f}',
-                     'GP': f'{gradient_penalty.item():.4f}'
+                     'GP': f'{gradient_penalty.item():.4f}',
+                     'Recon Loss': f'{loss_recon.item():.4f}' if lambda_recon > 0 else 'N/A'
                  })
             if self.writer:
                 self.writer.add_scalar('train/D_loss_step', d_loss.item(), self.global_step)
                 self.writer.add_scalar('train/G_loss_step', g_loss.item(), self.global_step)
                 self.writer.add_scalar('train/GP_step', gradient_penalty.item(), self.global_step)
+                if lambda_recon > 0:
+                    self.writer.add_scalar('train/Reconstruction_loss_step', loss_recon.item(), self.global_step)
             # TODO: Add Tensorboard logging if desired
 
         avg_d_loss = total_d_loss / batch_count
         avg_g_loss = total_g_loss / batch_count
         avg_gp = total_gp / batch_count
-        logger.info(f"Epoch {epoch+1} finished. Avg D Loss: {avg_d_loss:.4f}, Avg G Loss: {avg_g_loss:.4f}, Avg GP: {avg_gp:.4f}")
+        avg_recon_loss = total_recon_loss / batch_count if batch_count else 0.0
+        logger.info(f"Epoch {epoch+1} finished. Avg D Loss: {avg_d_loss:.4f}, Avg G Loss: {avg_g_loss:.4f}, Avg GP: {avg_gp:.4f}, Avg Recon Loss: {avg_recon_loss:.4f}")
         if self.writer:
             self.writer.add_scalar('train/D_loss_epoch', avg_d_loss, epoch)
             self.writer.add_scalar('train/G_loss_epoch', avg_g_loss, epoch)
             self.writer.add_scalar('train/GP_epoch', avg_gp, epoch)
+            self.writer.add_scalar('train/Reconstruction_loss_epoch', avg_recon_loss, epoch)
 
         # Store losses for summary
-        self.last_epoch_losses = {'D_Loss': avg_d_loss, 'G_Loss': avg_g_loss, 'GP': avg_gp}
+        self.last_epoch_losses = {'D_Loss': avg_d_loss, 'G_Loss': avg_g_loss, 'GP': avg_gp, 'Recon_Loss': avg_recon_loss}
+
+    def _pretrain_ae_epoch(self, epoch: int):
+        """Pretrain Autoencoder (encoder+decoder) with MLE for warm-start."""
+        self.encoder.train()
+        self.decoder.train()
+        total_loss = 0.0
+        batch_count = 0
+        pbar = tqdm(self.train_loader, desc=f"Pretrain AE Epoch {epoch+1}")
+        for batch_idx, real_texts in enumerate(pbar):
+            batch_count += 1
+            encoding = self.tokenizer(
+                real_texts,
+                padding='max_length', truncation=True,
+                max_length=self.config['data'].get('max_seq_length'),
+                return_tensors='pt'
+            ).to(self.device)
+            input_ids = encoding.input_ids
+            decoder_input = input_ids[:, :-1]
+            decoder_target = input_ids[:, 1:]
+            with autocast('cuda', enabled=self.use_amp):
+                latents = self.encoder(real_texts)
+                logits = self.decoder(latents, decoder_input)
+                loss = self.criterion_recon(
+                    logits.reshape(-1, self.vocab_size), decoder_target.reshape(-1)
+                ) * self.config['training'].get('lambda_reconstruction', 1.0)
+            self.optimizer_ae.zero_grad()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer_ae)
+            if self.scheduler_ae:
+                self.scheduler_ae.step()
+            self.scaler.update()
+            total_loss += loss.item()
+            if self.writer and batch_idx % 50 == 0:
+                self.writer.add_scalar('pretrain_ae/loss_step', loss.item(), self.global_step)
+            self.global_step += 1
+            pbar.set_postfix({'AE Loss': f'{loss.item():.4f}'})
+        avg_loss = total_loss / batch_count if batch_count else 0.0
+        logger.info(f"Pretrain AE Epoch {epoch+1} finished. Avg AE Loss: {avg_loss:.4f}")
+        if self.writer:
+            self.writer.add_scalar('pretrain_ae/loss_epoch', avg_loss, epoch)
+        self.last_epoch_losses['AE_Loss'] = avg_loss
 
     def _evaluate(self, epoch: int):
-        """Evaluate the model on the validation set and compute metrics."""
+        """Evaluate the model on the validation set, compute metrics, and track the best model."""
         if not self.val_loader:
             logger.warning("Validation loader not available, skipping evaluation.")
             return
@@ -486,14 +597,31 @@ class Trainer:
             else:
                 logger.warning("Skipping reference-based metrics as no references were available.")
 
-        # --- Log Final Summary --- 
-        logger.info(f"--- Evaluation Summary Epoch {epoch+1} ---")
-        for key, value in metrics_summary.items():
-            logger.info(f"{key}: {value:.4f}" if isinstance(value, float) else f"{key}: {value}")
-        logger.info(f"----------------------------------------")
+        # --- Check if this is the best model so far based on the chosen metric --- 
+        current_metric_value = metrics_summary.get(self.best_metric_name, -1.0)
+        is_best = False
+        # Only consider best model during GAN training phase (after pretraining)
+        if epoch >= self.config['training'].get('pretrain_ae_epochs', 0):
+            if current_metric_value > self.best_metric_value:
+                self.best_metric_value = current_metric_value
+                is_best = True
+                logger.info(f"*** New best model found at epoch {epoch+1} with {self.best_metric_name}: {current_metric_value:.4f} ***")
+        
+        # --- Save Checkpoint (including best model if applicable) ---
+        # We save the regular checkpoint regardless, but pass 'is_best' flag
+        self._save_checkpoint(epoch, is_best=is_best) 
+        # Note: _save_checkpoint is now called here instead of at the end of train() loop for the evaluated epoch
+
+        # Log detailed metrics to console/file
+        metrics_str = ", ".join([f"{k}: {v:.4f}" for k, v in metrics_summary.items()])
+        logger.info(f"Evaluation Epoch {epoch+1} Metrics - {metrics_str}")
 
     def _save_checkpoint(self, epoch: int, is_best: bool = False):
-        """Saves model and optimizer states."""
+        """Saves the current state of the models and optimizers."""
+        if not self.output_dir:
+            logger.warning("Checkpoint directory not specified. Skipping saving.")
+            return
+
         checkpoint_state = {
             'epoch': epoch,
             'global_step': self.global_step,
@@ -503,34 +631,96 @@ class Trainer:
             'decoder_state_dict': self.decoder.state_dict(),
             'optimizer_g_state_dict': self.optimizer_g.state_dict(),
             'optimizer_d_state_dict': self.optimizer_d.state_dict(),
-            # Add optimizer_ae if used
+            'optimizer_ae_state_dict': self.optimizer_ae.state_dict(),
             'scaler_state_dict': self.scaler.state_dict(),
             'config': self.config,
             'vocab_size': self.vocab_size,
-            'pad_token_id': self.pad_token_id
+            'pad_token_id': self.pad_token_id,
+            'best_metric_value': self.best_metric_value, # Save best metric score
+            'best_metric_name': self.best_metric_name, # Save which metric was used
         }
-        filename = f'checkpoint_epoch_{epoch+1}.pth.tar'
-        filepath = os.path.join(self.output_dir, filename)
-        torch.save(checkpoint_state, filepath)
-        logger.info(f"Checkpoint saved to {filepath}")
-        
-        if is_best:
-             best_filepath = os.path.join(self.output_dir, 'checkpoint_best.pth.tar')
-             torch.save(checkpoint_state, best_filepath)
-             logger.info(f"Best checkpoint saved to {best_filepath}")
+        latest_filename = os.path.join(self.output_dir, f"checkpoint_epoch_{epoch+1}.pth.tar")
+        torch.save(checkpoint_state, latest_filename)
+        logger.info(f"Checkpoint saved to {latest_filename}")
 
-    # TODO: Implement checkpoint loading _load_checkpoint
+        # If this is the best model so far, save it to a fixed 'best_model' file
+        if is_best:
+            best_filename = os.path.join(self.output_dir, "best_model.pth.tar")
+            torch.save(checkpoint_state, best_filename) # Overwrites previous best
+            # Optionally use shutil.copyfile(latest_filename, best_filename) if state dict is huge
+            logger.info(f"*** Best model checkpoint saved to {best_filename} (Metric: {self.best_metric_name}={self.best_metric_value:.4f}) ***")
+
+    def load_checkpoint(self, checkpoint_path=None, load_best=False):
+        """Loads a checkpoint to resume training. Can load the latest, a specific path, or the best model."""
+        load_path = None
+        if load_best:
+            load_path = os.path.join(self.output_dir, "best_model.pth.tar")
+            if not os.path.exists(load_path):
+                 logger.warning(f"'load_best' is True, but best model file not found at {load_path}. Trying latest.")
+                 load_path = None # Fallback to finding latest
+        elif checkpoint_path: # Specific path provided
+            load_path = checkpoint_path
+        
+        # If no specific path or best model requested/found, find the latest checkpoint
+        if not load_path and self.output_dir and os.path.exists(self.output_dir):
+             # Find the latest checkpoint file if path not provided
+             checkpoint_files = glob.glob(os.path.join(self.output_dir, 'checkpoint_epoch_*.pth.tar'))
+             if not checkpoint_files:
+                 logger.warning("No checkpoint files found in the specified directory.")
+                 return
+             else:
+                 # Sort by epoch number (extracted from filename)
+                 latest_checkpoint = max(checkpoint_files, key=lambda p: int(re.search(r'_epoch_(\d+)\.pth\.tar$', p).group(1)))
+                 load_path = latest_checkpoint
+ 
+        if not load_path or not os.path.exists(load_path):
+            logger.warning("No checkpoint file specified or found. Starting from scratch.")
+            return
+ 
+        logger.info(f"Loading checkpoint from {load_path}...")
+        checkpoint = torch.load(load_path, map_location=self.device)
+ 
+        # Load model states
+        self.generator.load_state_dict(checkpoint['generator_state_dict'])
+        self.discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
+        self.encoder.load_state_dict(checkpoint['encoder_state_dict'])
+        self.decoder.load_state_dict(checkpoint['decoder_state_dict'])
+ 
+        # Load optimizer states
+        self.optimizer_g.load_state_dict(checkpoint['optimizer_g_state_dict'])
+        self.optimizer_d.load_state_dict(checkpoint['optimizer_d_state_dict'])
+        self.optimizer_ae.load_state_dict(checkpoint['optimizer_ae_state_dict'])
+ 
+        # Load scaler state
+        self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+ 
+        # Load best metric tracking state if available
+        self.best_metric_value = checkpoint.get('best_metric_value', -1.0)
+        self.best_metric_name = checkpoint.get('best_metric_name', self.best_metric_name) # Keep config default if not in ckpt
+ 
+        self.start_epoch = checkpoint['epoch'] + 1
+        self.global_step = checkpoint.get('global_step', 0) # Added for compatibility
+ 
+        logger.info(f"Checkpoint loaded. Resuming training from epoch {self.start_epoch}. Best {self.best_metric_name} so far: {self.best_metric_value:.4f}")
+ 
+        # Check if loaded config matches current config (optional)
+        if 'config' in checkpoint and checkpoint['config'] != self.config:
+            logger.warning("Loaded checkpoint config does not match the current config. Continuing with the current config.")
 
     def train(self):
         """Main training loop across epochs."""
         logger.info("Starting training...")
         num_epochs = self.config['training'].get('num_epochs', 10)
+        pretrain_epochs = self.config['training'].get('pretrain_ae_epochs', 0)
         eval_every = self.config.get('evaluation', {}).get('eval_every_epochs', 1)
         
         for epoch in range(self.start_epoch, num_epochs):
             epoch_start_time = time.time()
-            
-            self._train_epoch(epoch)
+            # Warm-start MLE pretraining
+            if epoch < pretrain_epochs:
+                self._pretrain_ae_epoch(epoch)
+            else:
+                self._train_epoch(epoch)
             
             epoch_duration = time.time() - epoch_start_time
             logger.info(f"Epoch {epoch+1} completed in {epoch_duration:.2f} seconds.")
@@ -538,9 +728,11 @@ class Trainer:
             if (epoch + 1) % eval_every == 0:
                 self._evaluate(epoch)
             
-            # Save checkpoint periodically (e.g., every epoch)
-            self._save_checkpoint(epoch)
-
+            # Save checkpoint periodically for non-evaluation epochs
+            # Checkpoints for evaluation epochs are saved within _evaluate() now
+            elif (epoch + 1) % self.config['training'].get('save_every_epochs', 1) == 0: # Add save_every_epochs config
+                self._save_checkpoint(epoch, is_best=False) # is_best is only determined during evaluation
+ 
         logger.info("Training finished.")
 
         # Close TensorBoard writer when training is done
@@ -557,7 +749,7 @@ class Trainer:
 
         try:
             with torch.no_grad():
-                with torch.amp.autocast('cuda', enabled=self.use_amp): # New API
+                with autocast('cuda', enabled=self.use_amp): # New API
                     fake_latents = self.generator(noise)
                     
                     # Use decoder's generate method (assuming it exists and handles generation)

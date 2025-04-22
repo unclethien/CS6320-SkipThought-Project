@@ -143,13 +143,13 @@ class TextDecoder(nn.Module):
 
         return logits
 
-    # TODO: Implement a generate method for inference (autoregressive decoding)
     @torch.no_grad()
     def generate(self, latent_vector: torch.Tensor, 
                  start_token_id: int, 
                  max_new_tokens: int = 50, 
                  temperature: float = 1.0, 
-                 top_k: int = 0) -> torch.Tensor:
+                 top_k: int = 0,
+                 top_p: float = 1.0) -> torch.Tensor:
         """
         Generate text autoregressively from a latent vector.
 
@@ -159,6 +159,7 @@ class TextDecoder(nn.Module):
             max_new_tokens: Maximum number of tokens to generate.
             temperature: Softmax temperature for sampling.
             top_k: If > 0, performs top-k sampling.
+            top_p: If < 1.0, performs nucleus (top-p) sampling.
 
         Returns:
             Generated token indices. Shape: [batch_size, generated_seq_len].
@@ -209,6 +210,17 @@ class TextDecoder(nn.Module):
             if top_k > 0:
                 v, _ = torch.topk(last_token_logits, top_k)
                 last_token_logits[last_token_logits < v[:, [-1]]] = -float('Inf')
+            # Apply top-p (nucleus) filtering
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(last_token_logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                # Remove tokens with cumulative probability above threshold
+                sorted_mask = cumulative_probs > top_p
+                sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+                sorted_mask[..., 0] = False
+                # Scatter mask to original logits
+                indices_to_remove = sorted_mask.scatter(1, sorted_indices, sorted_mask)
+                last_token_logits[indices_to_remove] = -float('Inf')
             
             # Sample the next token
             probs = F.softmax(last_token_logits, dim=-1)
@@ -284,7 +296,8 @@ if __name__ == '__main__':
         start_token_id=_start_token_id, 
         max_new_tokens=_max_gen, 
         temperature=0.8, 
-        top_k=10
+        top_k=10,
+        top_p=0.9
     )
     logger.info(f"Generation Input Latent Shape: {gen_latent_vector.shape}")
     logger.info(f"Generated Token IDs Shape: {generated_ids.shape}")
