@@ -11,7 +11,7 @@ data:
   max_seq_length: 30 # Max sequence length for the Encoder/Decoder
   validation_split: 0.05 # Percentage of training data to use for validation
   test_split: 0.05       # Percentage of training data to use for testing
-  subset_percentage: 0.05 # Percentage of TRAINING split to use (e.g., 0.01 for 1%), null for full dataset
+  subset_percentage: 0.1 # Percentage of TRAINING split to use (e.g., 0.1 for 10%), null for full dataset
   seed: 42               # Seed for reproducibility in splitting
 
 model:
@@ -53,7 +53,7 @@ training:
   # Optimizers (Adam recommended for GANs)
   lr_g: 2.5e-5            # Halved from 5e-5
   lr_d: 2.5e-5            # Halved from 1e-4
-  lr_ae: 5e-5           # Halved from 1e-4
+  lr_ae: 2.5e-5           # Changed from 1e-5 back to 2.5e-5 per user request
   betas_g: [0.5, 0.999]
   betas_d: [0.5, 0.999]
   betas_ae: [0.9, 0.999] # Different beta1 for AE often helps
@@ -61,7 +61,7 @@ training:
   # WGAN-GP specific parameters
   n_critic: 1           # Number of discriminator updates per generator update
   lambda_gp: 10         # Gradient penalty coefficient
-  gradient_clip_val: 5.0 # Max norm for gradient clipping
+  gradient_clip_val: 1.0 # Max norm for gradient clipping (Reduced for stability)
 
   # Loss weights (if combining losses)
   lambda_reconstruction: 1.0 # Weight for autoencoder reconstruction loss (if used)
