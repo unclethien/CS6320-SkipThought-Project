@@ -11,6 +11,7 @@ data:
   max_seq_length: 30 # Max sequence length for the Encoder/Decoder
   validation_split: 0.05 # Percentage of training data to use for validation
   test_split: 0.05       # Percentage of training data to use for testing
+  subset_percentage: 0.05 # Percentage of TRAINING split to use (e.g., 0.01 for 1%), null for full dataset
   seed: 42               # Seed for reproducibility in splitting
 
 model:
@@ -19,7 +20,7 @@ model:
     # Options: 'bert-base-uncased', 'sentence-transformers/all-MiniLM-L6-v2', etc.
     # Or specify custom architecture params if not using pre-trained directly
     name: 'sentence-transformers/all-MiniLM-L6-v2'
-    trainable: false # Freeze pre-trained encoder initially?
+    trainable: true # Freeze pre-trained encoder initially?
     # latent_dim will be determined by the chosen encoder (e.g., 384 for all-MiniLM-L6-v2)
   
   decoder:
@@ -47,23 +48,23 @@ model:
 
 training:
   batch_size: 64 # Adjust based on memory
-  num_epochs: 30 # Set epochs to 30 for full training
-  pretrain_ae_epochs: 10 # Warm-start autoencoder MLE epochs
+  num_epochs: 20 # Set epochs to 20 for full training
+  pretrain_ae_epochs: 15 # Warm-start autoencoder MLE epochs
   # Optimizers (Adam recommended for GANs)
   lr_g: 2.5e-5            # Halved from 5e-5
-  lr_d: 5e-5            # Halved from 1e-4
+  lr_d: 2.5e-5            # Halved from 1e-4
   lr_ae: 5e-5           # Halved from 1e-4
   betas_g: [0.5, 0.999]
   betas_d: [0.5, 0.999]
   betas_ae: [0.9, 0.999] # Different beta1 for AE often helps
 
   # WGAN-GP specific parameters
-  n_critic: 5           # Number of discriminator updates per generator update
+  n_critic: 1           # Number of discriminator updates per generator update
   lambda_gp: 10         # Gradient penalty coefficient
-  gradient_clip_val: 1.0 # Max norm for gradient clipping
+  gradient_clip_val: 5.0 # Max norm for gradient clipping
 
   # Loss weights (if combining losses)
-  lambda_reconstruction: 5.0 # Weight for autoencoder reconstruction loss (if used)
+  lambda_reconstruction: 1.0 # Weight for autoencoder reconstruction loss (if used)
 
   # Other params
   use_amp: true         # Use Mixed Precision
@@ -84,7 +85,7 @@ evaluation:
     top_k: 50
     top_p: 0.9
   save_every_epochs: 1 # How often to save regular checkpoints
-  best_metric: 'BLEU-4' # Metric used to determine the 'best' model checkpoint (e.g., BLEU-4, METEOR, ROUGE-L, Recon_Loss)
+  best_metric: 'BERTScore_F1' # Metric used to determine the 'best' model checkpoint (e.g., BLEU-4, METEOR, ROUGE-L, Recon_Loss)
   # Metrics to compute (will compute all enabled ones)
   compute_bleu: true
   compute_meteor: true

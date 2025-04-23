@@ -76,24 +76,38 @@ def load_text_dataset_for_encoding(data_config):
             raw_datasets = load_dataset(dataset_name)
         logger.info(f"Dataset loaded: {raw_datasets}")
 
-        # --- Select Subset for Testing --- 
-        subset_percentage = 0.01 # Use 1% for testing
-        primary_split_key = None
-        if 'train' in raw_datasets:
-            primary_split_key = 'train'
-        elif len(raw_datasets.keys()) == 1:
-            primary_split_key = list(raw_datasets.keys())[0]
-        
-        if primary_split_key:
-            original_size = len(raw_datasets[primary_split_key])
-            subset_size = max(1, int(original_size * subset_percentage)) # Ensure at least 1 sample
-            logger.info(f"Selecting {subset_percentage*100:.2f}% ({subset_size} samples) of the '{primary_split_key}' split for testing.")
-            # Use shuffle(seed=seed) before select for potentially better representation
-            raw_datasets[primary_split_key] = raw_datasets[primary_split_key].shuffle(seed=seed).select(range(subset_size))
+        # Get subset percentage from config
+        subset_percentage = data_config.get('subset_percentage', None) # Get value, default to None
+
+        # --- Select Subset for Testing (if specified) ---
+        if subset_percentage is not None and 0 < subset_percentage <= 1.0:
+            primary_split_key = None
+            if 'train' in raw_datasets:
+                primary_split_key = 'train'
+            elif len(raw_datasets.keys()) == 1:
+                # If only one split exists, assume it's the primary one
+                primary_split_key = list(raw_datasets.keys())[0]
+
+            if primary_split_key:
+                original_size = len(raw_datasets[primary_split_key])
+                # Ensure subset_size calculation is robust
+                subset_size = max(1, int(round(original_size * subset_percentage))) # Use round and ensure at least 1
+                logger.info(f"Selecting {subset_percentage*100:.2f}% ({subset_size} samples) of the '{primary_split_key}' split.")
+                # Use shuffle(seed=seed) before select for potentially better representation
+                # Ensure indices are within bounds if dataset is smaller than expected
+                indices_to_select = range(min(subset_size, original_size))
+                if len(indices_to_select) < subset_size:
+                     logger.warning(f"Requested subset size ({subset_size}) is larger than the original split size ({original_size}). Using all {original_size} samples.")
+
+                raw_datasets[primary_split_key] = raw_datasets[primary_split_key].shuffle(seed=seed).select(indices_to_select)
+                logger.info(f"Dataset size after subset selection: {raw_datasets}")
+            else:
+                 logger.warning(f"Could not determine primary split (e.g., 'train') to select subset from. Using full dataset.")
+        elif subset_percentage is not None:
+             logger.warning(f"Invalid subset_percentage ({subset_percentage}) in config. Value must be between 0 and 1. Using full dataset.")
         else:
-             logger.warning(f"Could not determine primary split to select subset from. Using full dataset.")
-        logger.info(f"Dataset size after subset selection: {raw_datasets}")
-        
+            logger.info("No subset_percentage specified in config. Using full dataset for training.")
+
         # --- Dataset Splitting Logic ---
         train_exists = 'train' in raw_datasets
         val_exists = 'validation' in raw_datasets
