@@ -59,6 +59,8 @@ def load_text_dataset_for_encoding(data_config):
     batch_size = data_config.get('batch_size', 32)
     text_column = data_config.get('text_column', 'text')
     validation_split_percentage = data_config.get('validation_split', 0.05) # Use 5% for validation
+    test_split_percentage = data_config.get('test_split', 0.05)             # Use 5% for test
+    seed = data_config.get('seed', 42)
     filter_author = data_config.get('filter_author', None)
     # Note: Filtering by author on large datasets like bookcorpus might require specific handling
     # depending on the dataset structure (metadata columns, etc.) - not implemented here.
@@ -74,23 +76,75 @@ def load_text_dataset_for_encoding(data_config):
             raw_datasets = load_dataset(dataset_name)
         logger.info(f"Dataset loaded: {raw_datasets}")
 
-        # If the dataset doesn't have standard splits (train, validation, test)
-        # E.g., bookcorpus might just have 'train'
-        if 'train' not in raw_datasets:
-            # Assuming the first key is the main data split
-            main_split_key = list(raw_datasets.keys())[0]
-            logger.warning(f"Dataset has no 'train' split. Using '{main_split_key}' as main data.")
-            # Split the main data into train and validation
-            split_dataset = raw_datasets[main_split_key].train_test_split(test_size=validation_split_percentage, seed=data_config.get('seed', 42))
-            raw_datasets = load_dataset(dataset_name, split=split_dataset)
-            logger.info(f"Manually split into train/validation: {raw_datasets}")
-        elif 'validation' not in raw_datasets:
-             logger.warning(f"Dataset has no 'validation' split. Splitting from 'train'.")
-             split_dataset = raw_datasets['train'].train_test_split(test_size=validation_split_percentage, seed=data_config.get('seed', 42))
+        # --- Select Subset for Testing --- 
+        subset_percentage = 0.01 # Use 1% for testing
+        primary_split_key = None
+        if 'train' in raw_datasets:
+            primary_split_key = 'train'
+        elif len(raw_datasets.keys()) == 1:
+            primary_split_key = list(raw_datasets.keys())[0]
+        
+        if primary_split_key:
+            original_size = len(raw_datasets[primary_split_key])
+            subset_size = max(1, int(original_size * subset_percentage)) # Ensure at least 1 sample
+            logger.info(f"Selecting {subset_percentage*100:.2f}% ({subset_size} samples) of the '{primary_split_key}' split for testing.")
+            # Use shuffle(seed=seed) before select for potentially better representation
+            raw_datasets[primary_split_key] = raw_datasets[primary_split_key].shuffle(seed=seed).select(range(subset_size))
+        else:
+             logger.warning(f"Could not determine primary split to select subset from. Using full dataset.")
+        logger.info(f"Dataset size after subset selection: {raw_datasets}")
+        
+        # --- Dataset Splitting Logic ---
+        train_exists = 'train' in raw_datasets
+        val_exists = 'validation' in raw_datasets
+        test_exists = 'test' in raw_datasets
+
+        if train_exists and not val_exists and not test_exists:
+            logger.warning("Dataset has only 'train' split. Creating 'validation' and 'test' splits.")
+            # Split train into train_val and test
+            train_val_split = raw_datasets['train'].train_test_split(
+                test_size=test_split_percentage, seed=seed
+            )
+            raw_datasets['test'] = train_val_split['test']
+            train_val_data = train_val_split['train']
+
+            # Split train_val into train and validation
+            # Adjust validation percentage relative to the *remaining* data
+            adjusted_val_percentage = validation_split_percentage / (1.0 - test_split_percentage)
+            final_split = train_val_data.train_test_split(
+                test_size=adjusted_val_percentage, seed=seed
+            )
+            raw_datasets['train'] = final_split['train']
+            raw_datasets['validation'] = final_split['test']
+            logger.info(f"Created train/validation/test splits: {raw_datasets}")
+
+        elif train_exists and val_exists and not test_exists:
+            logger.warning("Dataset has 'train' and 'validation', but no 'test' split. Creating 'test' from 'train'.")
+            split_dataset = raw_datasets['train'].train_test_split(
+                test_size=test_split_percentage, seed=seed
+            )
+            raw_datasets['train'] = split_dataset['train']
+            raw_datasets['test'] = split_dataset['test']
+            logger.info(f"Split 'train' into train/test: {raw_datasets}")
+        
+        elif train_exists and not val_exists and test_exists:
+             logger.warning("Dataset has 'train' and 'test', but no 'validation' split. Creating 'validation' from 'train'.")
+             split_dataset = raw_datasets['train'].train_test_split(
+                 test_size=validation_split_percentage, seed=seed
+             )
              raw_datasets['train'] = split_dataset['train']
              raw_datasets['validation'] = split_dataset['test']
              logger.info(f"Split 'train' into train/validation: {raw_datasets}")
         
+        elif not train_exists:
+             # Handle cases where the primary split isn't named 'train'
+             # This logic might need refinement depending on datasets encountered
+             main_split_key = list(raw_datasets.keys())[0]
+             logger.error(f"Dataset missing 'train' split. Cannot reliably create train/val/test from '{main_split_key}'. Please check dataset structure.")
+             raise ValueError("Dataset missing 'train' split.")
+        else:
+            logger.info("Using existing 'train', 'validation', and 'test' splits.")
+
         # --- Preprocessing --- 
         def preprocess_function(examples):
             # Minimal preprocessing: Ensure text is string, maybe basic cleaning
@@ -131,15 +185,25 @@ def load_text_dataset_for_encoding(data_config):
             collate_fn=collate_fn
         )
 
+        test_dataloader = None
+        if 'test' in processed_datasets:
+            test_dataloader = DataLoader(
+                processed_datasets['test'],
+                batch_size=batch_size,
+                shuffle=False,
+                collate_fn=collate_fn
+            )
+            logger.info(f"Test DataLoader created. Test batches: {len(test_dataloader)}")
+        else:
+             logger.warning("No 'test' split available after processing. Test DataLoader not created.")
+
         logger.info(f"DataLoaders created. Train batches: {len(train_dataloader)}, Eval batches: {len(eval_dataloader)}")
 
-        # We don't need a tokenizer for the input to the encoder, 
-        # but the Decoder will need one later. We can load it in the main script/Trainer.
         # Placeholder for vocabulary size if needed elsewhere (e.g., for Decoder output layer)
         # This should come from the actual tokenizer used for the Decoder
         vocab_size = data_config.get('model', {}).get('decoder', {}).get('vocab_size', 30522) # Get from config
         
-        return train_dataloader, eval_dataloader, vocab_size
+        return train_dataloader, eval_dataloader, test_dataloader, vocab_size
 
     except Exception as e:
         logger.error(f"Failed to load or process dataset '{dataset_name}': {e}")
@@ -161,6 +225,7 @@ if __name__ == '__main__':
         'batch_size': 4,
         'text_column': 'text',
         'validation_split': 0.1,
+        'test_split': 0.1,
         'seed': 42,
         'model': {
             'decoder': {'vocab_size': 30000} # Example vocab size
@@ -168,7 +233,7 @@ if __name__ == '__main__':
     }
     
     try:
-        train_dl, eval_dl, vocab_size = load_and_prepare_dataset(test_config)
+        train_dl, eval_dl, test_dl, vocab_size = load_and_prepare_dataset(test_config)
         
         logger.info(f"Successfully loaded data. Vocab size (placeholder): {vocab_size}")
         logger.info("Checking first batch of training data...")
@@ -183,6 +248,13 @@ if __name__ == '__main__':
         logger.info(f"Type of batch: {type(first_eval_batch)}")
         logger.info(f"Length of batch: {len(first_eval_batch)}")
         logger.info(f"First item:\n{first_eval_batch[0]}") # Corrected f-string
+        
+        if test_dl:
+            logger.info("\nChecking first batch of test data...")
+            first_test_batch = next(iter(test_dl))
+            logger.info(f"Type of batch: {type(first_test_batch)}")
+            logger.info(f"Length of batch: {len(first_test_batch)}")
+            logger.info(f"First item:\n{first_test_batch[0]}") # Corrected f-string
         
     except Exception as e: # Added missing except block
         logger.error(f"Error during example usage: {e}", exc_info=True)

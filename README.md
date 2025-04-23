@@ -4,6 +4,12 @@
 
 <!-- Task -->
 
+## Goal
+
+This project implements a Generative Adversarial Network (GAN) that operates in the latent space of a Transformer-based autoencoder. The primary goal is to generate coherent and diverse text samples that mimic the style and content of a given corpus (e.g., BookCorpus).
+
+<!-- Task -->
+
 ## Task
 
 Due date: Fri, Apr 18
@@ -56,10 +62,7 @@ pip install -r requirements.txt
 
 ### 2. Data Preparation
 
-**(Placeholder)** The current `data/dataset.py` contains placeholder logic. You need to:
-1.  Modify `data/dataset.py` to load your specific paraphrase dataset (e.g., from text files, CSV).
-2.  Ensure the dataset class yields dictionaries with the keys expected by the `Trainer` in `training/trainer.py`.
-3.  Update the tokenizer loading in `main.py` if you are not using the default Hugging Face `AutoTokenizer` approach (currently placeholder).
+The script `data/dataset.py` handles loading datasets specified in the configuration (e.g., 'bookcorpus' from the Hugging Face `datasets` library). It automatically performs train, validation, and test splits based on percentages defined in the configuration file (`configs/default.yaml`). It also supports using a smaller subset of the data for faster testing.
 
 ### 3. Configuration
 
@@ -70,11 +73,14 @@ Training parameters, model dimensions, file paths, etc., are controlled via YAML
 
 ### 4. Training the Model
 
-Once the environment is set up and the data loading is implemented, start the training process using `main.py` and specify a configuration file:
+Once the environment is set up, start the training process using `main.py` and specify a configuration file:
 
 ```bash
-# Ensure your virtual environment is active
+# Start training from scratch
 python main.py --config configs/default.yaml
+
+# Resume training from a specific checkpoint
+python main.py --config configs/default.yaml --resume_checkpoint path/to/your/checkpoint.pth.tar
 ```
 
 The script will:
@@ -84,14 +90,16 @@ The script will:
 *   Start the training loop managed by the `Trainer` class.
 *   Handle device placement (CPU/GPU).
 *   (Optionally) Use mixed precision training if enabled in the config.
-*   Save model checkpoints to the directory specified in the config.
+*   Save model checkpoints periodically to the `results/` directory specified in the config.
 
 ### 5. Evaluation
 
-Evaluation metrics (BLEU, ROUGE, METEOR, Distinct-N, Self-BLEU) are implemented in `evaluation/metrics.py`.
+Evaluation metrics are calculated within the `Trainer` class (`training/trainer.py`) using the Hugging Face `evaluate` library and custom functions for diversity metrics.
 
-*   The `Trainer` class includes logic to perform periodic evaluation during training based on the configuration.
-*   To run evaluation on a saved model checkpoint against a test set, you might need to adapt `main.py` or create a separate evaluation script that loads the model and runs the metrics from `evaluation/metrics.py`.
+*   **Metrics:** BLEU, METEOR, ROUGE-L, BERTScore, Distinct-N (Distinct-1, Distinct-2), and Self-BLEU.
+*   The `Trainer` performs periodic evaluation on the validation set during training based on the `evaluation.eval_every_epochs` setting in the configuration.
+*   After training completes, a final evaluation is run on the test set.
+*   Results are logged to the console and TensorBoard.
 
 ### Project Structure
 
@@ -100,22 +108,19 @@ The project follows a modular structure:
 -   **`main.py`**: Main entry point to start training.
 -   **`configs/`**: Contains YAML configuration files (e.g., `default.yaml`).
 -   **`data/`**: Data loading and processing.
-    -   `dataset.py`: Defines the PyTorch Dataset and DataLoader logic (requires implementation for your data).
+    -   `dataset.py`: Defines the PyTorch Dataset and DataLoader logic, including splitting.
 -   **`model/`**: Model definitions.
-    -   `encoder.py`: VAE Encoder.
-    -   `generator.py`: Transformer-based Generator.
-    -   `discriminator.py`: InfoGAN Discriminator with Minibatch Discrimination.
--   **`training/`**: Training loop and loss functions.
-    -   `trainer.py`: Manages the training process (model updates, optimization, evaluation calls).
-    -   `losses.py`: WGAN-GP loss, InfoGAN loss components.
--   **`evaluation/`**: Evaluation metrics and logic.
-    -   `metrics.py`: Implementation of BLEU, ROUGE, METEOR, Distinct-N, Self-BLEU.
+    -   `text_encoder.py`: Transformer-based Sentence Encoder.
+    -   `text_decoder.py`: Transformer-based Text Decoder.
+    -   `gan_networks.py`: Latent space Generator (MLP) and Discriminator (MLP).
+-   **`training/`**: Training loop and related logic.
+    -   `trainer.py`: Manages the training process (model updates, optimization, evaluation, checkpointing, logging). Handles WGAN-GP loss and reconstruction loss internally.
+-   **`evaluation/`**: (Directory might contain evaluation scripts or analysis, but core metric calculation is in trainer.py)
 -   **`utils/`**: Utility functions.
     -   `helpers.py`: General helper functions (e.g., `set_seed`).
     -   `decoding.py`: Sampling functions (e.g., top-k/top-p).
 -   **`requirements.txt`**: Project dependencies.
--   **`checkpoints/`**: (Created during training) Directory to save model checkpoints.
--   **`results/`**: (Optional) Directory to save generated samples or evaluation outputs.
+-   **`results/`**: (Created during training) Directory to save model checkpoints, TensorBoard logs, and potentially generated samples or evaluation outputs.
 
 ### Download NLTK Data
 

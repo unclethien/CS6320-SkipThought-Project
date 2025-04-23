@@ -5,11 +5,13 @@ output_dir: results/latent_gan_run
 
 data:
   # path: "./data" # Path to dataset
-  dataset_name: 'wikitext' # Use wikitext
-  dataset_config_name: 'wikitext-103-raw-v1' # Specific config for wikitext-103
+  dataset_name: 'bookcorpus' # Use bookcorpus
   filter_author: null # Specify author/series to filter BookCorpus if needed
   text_column: 'text' # Column name in the dataset containing text
   max_seq_length: 30 # Max sequence length for the Encoder/Decoder
+  validation_split: 0.05 # Percentage of training data to use for validation
+  test_split: 0.05       # Percentage of training data to use for testing
+  seed: 42               # Seed for reproducibility in splitting
 
 model:
   # --- Text Autoencoder --- 
@@ -45,12 +47,12 @@ model:
 
 training:
   batch_size: 64 # Adjust based on memory
-  num_epochs: 25 # Set epochs to 20 for full training
-  pretrain_ae_epochs: 5 # Warm-start autoencoder MLE epochs
+  num_epochs: 30 # Set epochs to 30 for full training
+  pretrain_ae_epochs: 10 # Warm-start autoencoder MLE epochs
   # Optimizers (Adam recommended for GANs)
-  lr_g: 5e-5            # Learning rate for GAN Generator
-  lr_d: 1e-4            # Learning rate for GAN Discriminator
-  lr_ae: 1e-4           # Learning rate for Autoencoder (if trained jointly)
+  lr_g: 2.5e-5            # Halved from 5e-5
+  lr_d: 5e-5            # Halved from 1e-4
+  lr_ae: 5e-5           # Halved from 1e-4
   betas_g: [0.5, 0.999]
   betas_d: [0.5, 0.999]
   betas_ae: [0.9, 0.999] # Different beta1 for AE often helps
@@ -58,9 +60,10 @@ training:
   # WGAN-GP specific parameters
   n_critic: 5           # Number of discriminator updates per generator update
   lambda_gp: 10         # Gradient penalty coefficient
+  gradient_clip_val: 1.0 # Max norm for gradient clipping
 
   # Loss weights (if combining losses)
-  lambda_reconstruction: 1.0 # Weight for autoencoder reconstruction loss (if used)
+  lambda_reconstruction: 5.0 # Weight for autoencoder reconstruction loss (if used)
 
   # Other params
   use_amp: true         # Use Mixed Precision

@@ -1,5 +1,5 @@
 # Ignore generated results, including model checkpoints
-# results/
+results/
 
 # Ignore Python cache files
 __pycache__/
@@ -8,3 +8,17 @@ __pycache__/
 
 # Ignore virtual environment directory
 .venv/
+venv/
+
+# Ignore NLTK downloaded data
+nltk_data/
+
+# Ignore IDE settings
+.vscode/
+.idea/
+
+# Ignore log files
+*.log
+
+# Ignore macOS files
+.DS_Store

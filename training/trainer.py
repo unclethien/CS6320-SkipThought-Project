@@ -21,6 +21,7 @@ from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction # Added f
 import ssl
 import random # <<< Add this import
 from torch.utils.tensorboard import SummaryWriter # Import SummaryWriter
+import numpy as np  # Added for BERTScore averaging
 
 # Ensure NLTK data is available (might be better in main.py or setup script)
 try:
@@ -66,10 +67,13 @@ def calculate_distinct_n(sentences, n):
 
 class Trainer:
     """Trains a Latent Space GAN using WGAN-GP."""
-    def __init__(self, config_path: str):
+    def __init__(self, config_path: str, resume_checkpoint: str = None):
         logger.info(f"Initializing Trainer with config: {config_path}")
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
+
+        # Store resume path if provided
+        self.resume_checkpoint = resume_checkpoint
 
         # --- Setup --- 
         self.seed = self.config.get('seed', 42)
@@ -110,8 +114,12 @@ class Trainer:
         # --- Data --- 
         logger.info("Loading dataset...")
         # Pass only the data part of the config
-        self.train_loader, self.val_loader, _ = load_and_prepare_dataset(self.config['data'])
+        self.train_loader, self.val_loader, self.test_loader, _vocab_size_from_data = load_and_prepare_dataset(self.config['data'])
         logger.info("Dataset loaded.")
+        if self.test_loader:
+            logger.info(f"Test dataloader loaded with {len(self.test_loader)} batches.")
+        else:
+            logger.warning("Test dataloader was not created/returned.")
 
         # --- Models --- 
         logger.info("Initializing models...")
@@ -297,6 +305,9 @@ class Trainer:
         total_gp = 0.0
         batch_count = 0
 
+        # Read gradient clipping value from config
+        gradient_clip_val = self.config['training'].get('gradient_clip_val', None)
+
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}")
         for batch_idx, real_texts in enumerate(pbar):
             batch_size = len(real_texts)
@@ -339,6 +350,10 @@ class Trainer:
                 total_d_loss += d_loss.item() / self.n_critic
                 total_gp += gradient_penalty.item() / self.n_critic
 
+            # Unscale gradients before clipping and stepping D
+            self.scaler.unscale_(self.optimizer_d)
+            if gradient_clip_val:
+                torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), gradient_clip_val)
             self.scaler.step(self.optimizer_d)
             if self.scheduler_d:
                 self.scheduler_d.step()
@@ -363,6 +378,10 @@ class Trainer:
             
             # Backward pass and optimization step for Generator
             self.scaler.scale(g_loss).backward()
+            # Unscale gradients before clipping and stepping G
+            self.scaler.unscale_(self.optimizer_g)
+            if gradient_clip_val:
+                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), gradient_clip_val)
             self.scaler.step(self.optimizer_g)
             if self.scheduler_g:
                 self.scheduler_g.step()
@@ -391,6 +410,11 @@ class Trainer:
                     )
                     loss_recon = lambda_recon * loss_recon
                 self.scaler.scale(loss_recon).backward()
+                # Unscale gradients before clipping and stepping AE
+                self.scaler.unscale_(self.optimizer_ae)
+                if gradient_clip_val:
+                    # Clip combined Encoder + Decoder params
+                    torch.nn.utils.clip_grad_norm_(list(self.encoder.parameters()) + list(self.decoder.parameters()), gradient_clip_val)
                 self.scaler.step(self.optimizer_ae)
                 if self.scheduler_ae:
                     self.scheduler_ae.step()
@@ -591,11 +615,27 @@ class Trainer:
                     logger.info(f"Evaluation Metrics - ROUGE-L: {rouge_l_score:.4f}")
                     if self.writer:
                         self.writer.add_scalar('Evaluation/ROUGE-L', rouge_l_score, epoch + 1)
-
                 except Exception as e:
-                    logger.error(f"Error computing reference-based metrics: {e}", exc_info=True)
+                    logger.error(f"Error computing reference-based metrics during evaluation: {e}", exc_info=True)
+                    # Provide default values if calculation fails
+                    metrics_summary.update({'bleu': 0.0, 'meteor': 0.0, 'rougeL': 0.0})
             else:
                 logger.warning("Skipping reference-based metrics as no references were available.")
+
+            # --- BERTScore ---
+            try:
+                bertscore = evaluate.load('bertscore')
+                bert_res = bertscore.compute(predictions=all_generated_texts,
+                                            references=[r[0] for r in all_reference_texts],
+                                            lang='en')
+                metrics_summary['BERTScore_P'] = float(np.mean(bert_res['precision']))
+                metrics_summary['BERTScore_R'] = float(np.mean(bert_res['recall']))
+                metrics_summary['BERTScore_F1'] = float(np.mean(bert_res['f1']))
+                logger.info(f"Evaluation Metrics - BERTScore F1: {metrics_summary['BERTScore_F1']:.4f}")
+                if self.writer:
+                    self.writer.add_scalar('Evaluation/BERTScore_F1', metrics_summary['BERTScore_F1'], epoch + 1)
+            except Exception as e:
+                logger.error(f"Error computing BERTScore: {e}")
 
         # --- Check if this is the best model so far based on the chosen metric --- 
         current_metric_value = metrics_summary.get(self.best_metric_name, -1.0)
@@ -713,6 +753,18 @@ class Trainer:
         num_epochs = self.config['training'].get('num_epochs', 10)
         pretrain_epochs = self.config['training'].get('pretrain_ae_epochs', 0)
         eval_every = self.config.get('evaluation', {}).get('eval_every_epochs', 1)
+
+        # --- Load Checkpoint --- 
+        self.start_epoch = 0 # Default start epoch
+        self.best_metric_value = -float('inf') if self.config['evaluation'].get('higher_is_better', True) else float('inf')
+
+        if self.resume_checkpoint:
+            logger.info(f"Attempting to resume from specified checkpoint: {self.resume_checkpoint}")
+            self.load_checkpoint(checkpoint_path=self.resume_checkpoint)
+        elif self.config['training'].get('resume', False):
+            logger.info("Attempting to resume from latest checkpoint based on config...")
+            self.load_checkpoint() # Will try latest or best based on load_checkpoint logic
+        # ------------------------
         
         for epoch in range(self.start_epoch, num_epochs):
             epoch_start_time = time.time()
@@ -734,10 +786,86 @@ class Trainer:
                 self._save_checkpoint(epoch, is_best=False) # is_best is only determined during evaluation
  
         logger.info("Training finished.")
+        self.test() # Call the new test method
+        logger.info("Trainer.train() method finished.")
 
         # Close TensorBoard writer when training is done
         if self.writer:
             self.writer.close()
+
+    def test(self):
+        """Runs evaluation on the test dataset after training is complete."""
+        if not self.test_loader:
+            logger.warning("Test loader not available, skipping testing.")
+            return
+
+        logger.info("--- Starting Test Evaluation --- ")
+        self.generator.eval()
+        self.encoder.eval() # Encoder is needed to get latents from real text for comparison/metrics
+        self.decoder.eval() # Decoder is needed to generate text from latents
+
+        all_predictions = []
+        all_references = [] # Using test set as references
+
+        # Use the test loader
+        pbar = tqdm(self.test_loader, desc="Testing")
+        with torch.no_grad():
+            for batch_idx, real_texts_batch in enumerate(pbar):
+                # Use real texts from test set as references
+                references_for_batch = [[text] for text in real_texts_batch] # Wrap each ref in a list for evaluate lib
+                all_references.extend(references_for_batch)
+
+                batch_size = len(real_texts_batch)
+                
+                # Generate fake samples from noise
+                z = torch.randn(batch_size, self.noise_dim, device=self.device)
+                fake_latents = self.generator(z)
+
+                # Decode fake latents into text
+                # Need to handle the decoder's input requirements
+                # Assuming decoder needs a start token and generates sequentially
+                # This part might need adjustment based on the specific TextDecoder implementation
+                generated_texts = self.generate_text_from_latent(fake_latents)
+                all_predictions.extend(generated_texts)
+
+                # Optional: Log a few examples periodically
+                if batch_idx % 100 == 0: 
+                    logger.debug(f"Test Sample Prediction: {generated_texts[0]}")
+                    logger.debug(f"Test Sample Reference: {references_for_batch[0][0]}")
+        
+        # --- Calculate Metrics --- 
+        metrics = {}
+        if all_predictions and all_references:
+            try:
+                bleu_result = evaluate.load('bleu').compute(predictions=all_predictions, references=all_references)
+                metrics['bleu'] = bleu_result['bleu']
+                meteor_result = evaluate.load('meteor').compute(predictions=all_predictions, references=all_references)
+                metrics['meteor'] = meteor_result['meteor']
+                rouge_result = evaluate.load('rouge').compute(predictions=all_predictions, references=all_references)
+                metrics['rougeL'] = rouge_result['rougeL']
+                # --- BERTScore ---
+                try:
+                    bertscore = evaluate.load('bertscore')
+                    bert_res = bertscore.compute(predictions=all_predictions,
+                                                references=[r[0] for r in all_references],
+                                                lang='en')
+                    metrics['bertscore_f1'] = float(np.mean(bert_res['f1']))
+                except Exception as e:
+                    logger.error(f"Error computing BERTScore on test: {e}")
+            except Exception as e:
+                logger.error(f"Error calculating test metrics: {e}", exc_info=True)
+                metrics = {'bleu': 0.0, 'meteor': 0.0, 'rougeL': 0.0}
+        else:
+            logger.warning("No predictions or references generated during testing, cannot compute metrics.")
+            metrics = {'bleu': 0.0, 'meteor': 0.0, 'rougeL': 0.0}
+
+        # --- Log Test Results --- 
+        logger.info("--- Test Results --- ")
+        for name, score in metrics.items():
+            logger.info(f"Final Test {name.upper()}: {score:.4f}")
+            # Optionally log to TensorBoard (e.g., using a large step number like self.total_epochs + 1)
+            # self.writer.add_scalar(f'Test/{name}', score, self.config['training']['epochs'] + 1)
+        logger.info("--- Test Evaluation Finished --- ")
 
     def generate_text_from_noise(self, num_samples=1, max_length=64):
         """Generates text samples from random noise using G and Decoder."""
@@ -775,6 +903,43 @@ class Trainer:
             
         except Exception as e:
             logger.error(f"Error during generate_text_from_noise: {e}", exc_info=True)
+            # Return empty list or re-raise depending on desired handling
+            return []
+
+        return generated_texts
+
+    def generate_text_from_latent(self, latents):
+        """Generates text from the given latent vectors using the decoder."""
+        self.decoder.eval()
+        
+        generated_texts = []
+
+        try:
+            with torch.no_grad():
+                with autocast('cuda', enabled=self.use_amp): # New API
+                    # Use decoder's generate method (assuming it exists and handles generation)
+                    # Pass necessary generation parameters (e.g., start token, max length)
+                    # We might need to get start_token_id similar to how it was done before
+                    start_token_id = self.tokenizer.bos_token_id if self.tokenizer.bos_token_id is not None else self.tokenizer.cls_token_id
+                    if start_token_id is None: # Fallback if no BOS/CLS
+                        start_token_id = self.tokenizer.pad_token_id
+                        logger.warning(f"No BOS or CLS token found. Using PAD token ({start_token_id}) as start token for generation.")
+                        
+                    # Assuming decoder has a method like `generate` or similar
+                    # The TextDecoder class might need its own generate method wrapping the underlying model's generate
+                    generated_ids = self.decoder.generate(
+                        latent_vector=latents, 
+                        max_new_tokens=self.decoder_max_length - 1, # Match TextDecoder param, adjust for start token
+                        start_token_id=start_token_id # Match TextDecoder param
+                        # Add other generation params if needed (temperature, top_k etc.)
+                        # These could be read from config['evaluation']['generation_params'] if desired
+                    )
+                    
+            # Decode generated IDs to text
+            generated_texts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+            
+        except Exception as e:
+            logger.error(f"Error during generate_text_from_latent: {e}", exc_info=True)
             # Return empty list or re-raise depending on desired handling
             return []
 
@@ -837,11 +1002,12 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Train Latent Space GAN')
     parser.add_argument('--config', type=str, required=True, help='Path to the configuration YAML file')
+    parser.add_argument('--resume_checkpoint', type=str, default=None, help='Path to the checkpoint to resume from')
     args = parser.parse_args()
 
     # Setup logging
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-    trainer = Trainer(config_path=args.config)
+    trainer = Trainer(config_path=args.config, resume_checkpoint=args.resume_checkpoint)
     trainer.train()

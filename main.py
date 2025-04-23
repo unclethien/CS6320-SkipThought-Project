@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils.helpers import set_seed
 from training.trainer import Trainer
 
-def main(config_path: str):
+def main(config_path: str, resume_checkpoint: str = None):
     """Main function to run the Latent GAN training pipeline."""
 
     # --- Download NLTK data (for METEOR metric) ---
@@ -61,7 +61,7 @@ def main(config_path: str):
     # --- 4. Initialize Trainer --- 
     logging.info("Initializing Trainer...")
     try:
-        trainer = Trainer(config_path=config_path)
+        trainer = Trainer(config_path=config_path, resume_checkpoint=resume_checkpoint)
     except Exception as e:
         logging.error(f"Error initializing Trainer: {e}", exc_info=True)
         return
@@ -88,6 +88,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train a Transformer-Based Latent GAN.') 
     parser.add_argument('--config', type=str, default='configs/default.yaml', 
                         help='Path to the configuration YAML file.')
+    parser.add_argument('--resume_checkpoint', type=str, default=None,
+                        help='Path to a checkpoint file to resume training from.')
     args = parser.parse_args()
     
-    main(args.config)
+    main(args.config, args.resume_checkpoint)
