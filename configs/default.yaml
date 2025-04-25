@@ -47,7 +47,7 @@ model:
     hidden_dims: [512, 512] # Hidden layer sizes for MLP discriminator
 
 training:
-  batch_size: 64 # Adjust based on memory
+  batch_size: 16 # Adjust based on memory (Reduced from 32)
   num_epochs: 20 # Set epochs to 20 for full training
   pretrain_ae_epochs: 15 # Warm-start autoencoder MLE epochs
   # Optimizers (Adam recommended for GANs)
