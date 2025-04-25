@@ -355,9 +355,9 @@ class Trainer:
             if gradient_clip_val:
                 torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), gradient_clip_val)
             self.scaler.step(self.optimizer_d)
+            self.scaler.update()
             if self.scheduler_d:
                 self.scheduler_d.step()
-            self.scaler.update()
             self.optimizer_d.zero_grad() # Zero grad again just in case
 
             # === Train Generator === 
@@ -383,9 +383,9 @@ class Trainer:
             if gradient_clip_val:
                 torch.nn.utils.clip_grad_norm_(self.generator.parameters(), gradient_clip_val)
             self.scaler.step(self.optimizer_g)
+            self.scaler.update()
             if self.scheduler_g:
                 self.scheduler_g.step()
-            self.scaler.update()
             total_g_loss += g_loss.item()
 
             # === Autoencoder reconstruction step ===
@@ -416,9 +416,9 @@ class Trainer:
                     # Clip combined Encoder + Decoder params
                     torch.nn.utils.clip_grad_norm_(list(self.encoder.parameters()) + list(self.decoder.parameters()), gradient_clip_val)
                 self.scaler.step(self.optimizer_ae)
+                self.scaler.update()
                 if self.scheduler_ae:
                     self.scheduler_ae.step()
-                self.scaler.update()
                 total_recon_loss += loss_recon.item()
 
             # --- Logging --- 
@@ -478,10 +478,20 @@ class Trainer:
                 ) * self.config['training'].get('lambda_reconstruction', 1.0)
             self.optimizer_ae.zero_grad()
             self.scaler.scale(loss).backward()
+            
+            # Get gradient clipping value from config
+            gradient_clip_val = self.config['training'].get('gradient_clip_val', None)
+            
+            # Unscale gradients before clipping and stepping
+            self.scaler.unscale_(self.optimizer_ae)
+            if gradient_clip_val:
+                # Clip combined Encoder + Decoder params
+                torch.nn.utils.clip_grad_norm_(list(self.encoder.parameters()) + list(self.decoder.parameters()), gradient_clip_val)
+                
             self.scaler.step(self.optimizer_ae)
+            self.scaler.update()
             if self.scheduler_ae:
                 self.scheduler_ae.step()
-            self.scaler.update()
             total_loss += loss.item()
             if self.writer and batch_idx % 50 == 0:
                 self.writer.add_scalar('pretrain_ae/loss_step', loss.item(), self.global_step)
