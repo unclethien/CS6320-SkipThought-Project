@@ -634,7 +634,8 @@ class Trainer:
 
             # --- BERTScore ---
             try:
-                bertscore = evaluate.load('bertscore')
+                # Load BERTScore with roberta-base to reduce memory
+                bertscore = evaluate.load('bertscore', model_type='roberta-base')
                 bert_res = bertscore.compute(predictions=all_generated_texts,
                                             references=[r[0] for r in all_reference_texts],
                                             lang='en')
@@ -855,7 +856,8 @@ class Trainer:
                 metrics['rougeL'] = rouge_result['rougeL']
                 # --- BERTScore ---
                 try:
-                    bertscore = evaluate.load('bertscore')
+                    # Load BERTScore with roberta-base to reduce memory
+                    bertscore = evaluate.load('bertscore', model_type='roberta-base')
                     bert_res = bertscore.compute(predictions=all_predictions,
                                                 references=[r[0] for r in all_references],
                                                 lang='en')
