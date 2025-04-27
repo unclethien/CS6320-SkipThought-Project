@@ -634,11 +634,16 @@ class Trainer:
 
             # --- BERTScore ---
             try:
+                logger.info("Attempting to load BERTScore model...") 
                 # Load BERTScore with roberta-base to reduce memory
                 bertscore = evaluate.load('bertscore', model_type='roberta-base')
+                logger.info(f"BERTScore model loaded: {bertscore.model_type if hasattr(bertscore, 'model_type') else 'N/A'}") 
+                
+                logger.info("Attempting to compute BERTScore...") 
                 bert_res = bertscore.compute(predictions=all_generated_texts,
                                             references=[r[0] for r in all_reference_texts],
                                             lang='en')
+                logger.info("BERTScore computation finished.") 
                 metrics_summary['BERTScore_P'] = float(np.mean(bert_res['precision']))
                 metrics_summary['BERTScore_R'] = float(np.mean(bert_res['recall']))
                 metrics_summary['BERTScore_F1'] = float(np.mean(bert_res['f1']))
@@ -848,22 +853,29 @@ class Trainer:
         metrics = {}
         if all_predictions and all_references:
             try:
+                logger.info("Attempting to load BERTScore model...") 
+                # Load BERTScore with roberta-base to reduce memory
+                bertscore = evaluate.load('bertscore', model_type='roberta-base')
+                logger.info(f"BERTScore model loaded: {bertscore.model_type if hasattr(bertscore, 'model_type') else 'N/A'}") 
+                
+                logger.info("Attempting to compute BERTScore...") 
+                max_samples_for_bertscore = 40000
+                logger.info(f"Attempting to compute BERTScore on first {max_samples_for_bertscore} samples...") 
+                bert_res = bertscore.compute(predictions=all_predictions[:max_samples_for_bertscore],
+                                            references=[r[0] for r in all_references[:max_samples_for_bertscore]],
+                                            lang='en',
+                                            batch_size=16) # Add batch_size for potentially better memory handling
+                logger.info("BERTScore computation finished.") 
+                metrics['bertscore_f1'] = float(np.mean(bert_res['f1']))
+            except Exception as e:
+                logger.error(f"Error computing BERTScore on test: {e}")
+            try:
                 bleu_result = evaluate.load('bleu').compute(predictions=all_predictions, references=all_references)
                 metrics['bleu'] = bleu_result['bleu']
                 meteor_result = evaluate.load('meteor').compute(predictions=all_predictions, references=all_references)
                 metrics['meteor'] = meteor_result['meteor']
                 rouge_result = evaluate.load('rouge').compute(predictions=all_predictions, references=all_references)
                 metrics['rougeL'] = rouge_result['rougeL']
-                # --- BERTScore ---
-                try:
-                    # Load BERTScore with roberta-base to reduce memory
-                    bertscore = evaluate.load('bertscore', model_type='roberta-base')
-                    bert_res = bertscore.compute(predictions=all_predictions,
-                                                references=[r[0] for r in all_references],
-                                                lang='en')
-                    metrics['bertscore_f1'] = float(np.mean(bert_res['f1']))
-                except Exception as e:
-                    logger.error(f"Error computing BERTScore on test: {e}")
             except Exception as e:
                 logger.error(f"Error calculating test metrics: {e}", exc_info=True)
                 metrics = {'bleu': 0.0, 'meteor': 0.0, 'rougeL': 0.0}
@@ -884,19 +896,19 @@ class Trainer:
         self.generator.eval()
         self.decoder.eval()
         
-        noise = torch.randn(num_samples, self.noise_dim, device=self.device) # Use noise_dim
+        noise = torch.randn(num_samples, self.noise_dim, device=self.device) 
         generated_texts = []
 
         try:
             with torch.no_grad():
-                with autocast('cuda', enabled=self.use_amp): # New API
+                with autocast('cuda', enabled=self.use_amp): 
                     fake_latents = self.generator(noise)
                     
                     # Use decoder's generate method (assuming it exists and handles generation)
                     # Pass necessary generation parameters (e.g., start token, max length)
                     # We might need to get start_token_id similar to how it was done before
                     start_token_id = self.tokenizer.bos_token_id if self.tokenizer.bos_token_id is not None else self.tokenizer.cls_token_id
-                    if start_token_id is None: # Fallback if no BOS/CLS
+                    if start_token_id is None: 
                         start_token_id = self.tokenizer.pad_token_id
                         logger.warning(f"No BOS or CLS token found. Using PAD token ({start_token_id}) as start token for generation.")
                         
@@ -904,8 +916,8 @@ class Trainer:
                     # The TextDecoder class might need its own generate method wrapping the underlying model's generate
                     generated_ids = self.decoder.generate(
                         latent_vector=fake_latents, 
-                        max_new_tokens=max_length - 1, # Match TextDecoder param, adjust for start token
-                        start_token_id=start_token_id # Match TextDecoder param
+                        max_new_tokens=max_length - 1, 
+                        start_token_id=start_token_id 
                         # Add other generation params if needed (temperature, top_k etc.)
                         # These could be read from config['evaluation']['generation_params'] if desired
                     )
@@ -928,12 +940,12 @@ class Trainer:
 
         try:
             with torch.no_grad():
-                with autocast('cuda', enabled=self.use_amp): # New API
+                with autocast('cuda', enabled=self.use_amp): 
                     # Use decoder's generate method (assuming it exists and handles generation)
                     # Pass necessary generation parameters (e.g., start token, max length)
                     # We might need to get start_token_id similar to how it was done before
                     start_token_id = self.tokenizer.bos_token_id if self.tokenizer.bos_token_id is not None else self.tokenizer.cls_token_id
-                    if start_token_id is None: # Fallback if no BOS/CLS
+                    if start_token_id is None: 
                         start_token_id = self.tokenizer.pad_token_id
                         logger.warning(f"No BOS or CLS token found. Using PAD token ({start_token_id}) as start token for generation.")
                         
@@ -941,8 +953,8 @@ class Trainer:
                     # The TextDecoder class might need its own generate method wrapping the underlying model's generate
                     generated_ids = self.decoder.generate(
                         latent_vector=latents, 
-                        max_new_tokens=self.decoder_max_length - 1, # Match TextDecoder param, adjust for start token
-                        start_token_id=start_token_id # Match TextDecoder param
+                        max_new_tokens=self.decoder_max_length - 1, 
+                        start_token_id=start_token_id 
                         # Add other generation params if needed (temperature, top_k etc.)
                         # These could be read from config['evaluation']['generation_params'] if desired
                     )
@@ -967,8 +979,8 @@ def calculate_distinct_n(sentences: list, n: int):
     total_ngrams_count = 0
     
     for sentence in sentences:
-        tokens = nltk.word_tokenize(sentence.lower()) # Tokenize and lowercase
-        if not tokens: continue # Skip empty sentences after tokenization
+        tokens = nltk.word_tokenize(sentence.lower()) 
+        if not tokens: continue 
         current_ngrams = list(ngrams(tokens, n))
         all_ngrams.extend(current_ngrams)
         total_ngrams_count += len(current_ngrams)
@@ -982,29 +994,29 @@ def calculate_distinct_n(sentences: list, n: int):
 def calculate_self_bleu(sentences: list, n: int = 4):
     """Calculates Self-BLEU score for a list of sentences."""
     if len(sentences) < 2:
-        return 0.0 # Cannot compute Self-BLEU with less than 2 sentences
+        return 0.0 
 
     total_bleu = 0.0
-    smoothing_function = SmoothingFunction().method1 # Choose a smoothing method
-    weights = tuple(1. / n for _ in range(n)) # Uniform weights for BLEU-n
+    smoothing_function = SmoothingFunction().method1 
+    weights = tuple(1. / n for _ in range(n)) 
 
     tokenized_sentences = [nltk.word_tokenize(s.lower()) for s in sentences]
 
     for i in range(len(tokenized_sentences)):
         hypothesis = tokenized_sentences[i]
         references = tokenized_sentences[:i] + tokenized_sentences[i+1:]
-        if not hypothesis or not references: # Skip if hypothesis or all references are empty
+        if not hypothesis or not references: 
             continue
         # sentence_bleu expects references as a list of lists of tokens
         # Here, references is already a list of lists of tokens
         try:
             score = sentence_bleu(references, hypothesis, weights=weights, smoothing_function=smoothing_function)
             total_bleu += score
-        except ZeroDivisionError: # Handle cases where smoothing might not be enough
-             pass # Assign BLEU score of 0 if division by zero occurs
+        except ZeroDivisionError: 
+             pass 
         except Exception as e:
             logger.warning(f"Error during sentence_bleu calculation: {e}. Hyp: {hypothesis}, Ref sample: {references[0] if references else 'None'}")
-            pass # Skip sentence pair on other errors
+            pass 
 
     # Average BLEU score over all sentences
     return total_bleu / len(tokenized_sentences) if tokenized_sentences else 0.0

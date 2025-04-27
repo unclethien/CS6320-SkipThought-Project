@@ -48,7 +48,7 @@ model:
 
 training:
   batch_size: 16 # Adjust based on memory (Reduced from 32)
-  num_epochs: 30 # Increased from 20 to add 10 more GAN epochs
+  num_epochs: 25 # Increased from 20 to add 5 more GAN epochs
   pretrain_ae_epochs: 15 # Warm-start autoencoder MLE epochs
   # Optimizers (Adam recommended for GANs)
   lr_g: 2.5e-5            # Halved from 5e-5
