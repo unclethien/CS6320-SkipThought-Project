@@ -16,4 +16,3 @@ sentence-transformers>=2.0.0
 sacrebleu>=2.0.0
 # For TensorBoard logging
 tensorboard>=2.5.0
-standard-imghdr>=3.11.0     # Backport of imghdr for Python >= 3.11

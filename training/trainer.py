@@ -628,7 +628,7 @@ class Trainer:
                 except Exception as e:
                     logger.error(f"Error computing reference-based metrics during evaluation: {e}", exc_info=True)
                     # Provide default values if calculation fails
-                    metrics_summary.update({'bleu': 0.0, 'meteor': 0.0, 'rougeL': 0.0})
+                    metrics_summary.update({'BLEU-1': 0.0, 'BLEU-2': 0.0, 'BLEU-3': 0.0, 'BLEU-4': 0.0, 'METEOR': 0.0, 'ROUGE-L': 0.0})
             else:
                 logger.warning("Skipping reference-based metrics as no references were available.")
 
@@ -852,41 +852,82 @@ class Trainer:
         # --- Calculate Metrics --- 
         metrics = {}
         if all_predictions and all_references:
+            # --- Create a random subset for expensive metrics ---
+            num_total_samples = len(all_predictions)
+            max_samples_subset = min(10000, num_total_samples) # Use 10k or total if less
+            if num_total_samples > max_samples_subset:
+                logger.info(f"Creating random subset of {max_samples_subset} samples for expensive metrics...")
+                # Combine predictions and references to keep pairs aligned
+                combined_samples = list(zip(all_predictions, all_references))
+                random_subset_combined = random.sample(combined_samples, max_samples_subset)
+                # Separate back into predictions and references
+                predictions_subset = [item[0] for item in random_subset_combined]
+                references_subset = [item[1] for item in random_subset_combined] # references_subset is list of lists
+            else:
+                 logger.info("Using all samples for expensive metrics as total is <= subset size.")
+                 predictions_subset = all_predictions
+                 # references_subset needs the same format as all_references (list of lists)
+                 references_subset = all_references
+
+            # --- BERTScore (on subset) ---
             try:
                 logger.info("Attempting to load BERTScore model...") 
-                # Load BERTScore with roberta-base to reduce memory
                 bertscore = evaluate.load('bertscore', model_type='roberta-base')
                 logger.info(f"BERTScore model loaded: {bertscore.model_type if hasattr(bertscore, 'model_type') else 'N/A'}") 
                 
-                logger.info("Attempting to compute BERTScore...") 
-                max_samples_for_bertscore = 40000
-                logger.info(f"Attempting to compute BERTScore on first {max_samples_for_bertscore} samples...") 
-                bert_res = bertscore.compute(predictions=all_predictions[:max_samples_for_bertscore],
-                                            references=[r[0] for r in all_references[:max_samples_for_bertscore]],
+                logger.info(f"Attempting to compute BERTScore on {max_samples_subset} random samples...") 
+                # Use the random subset
+                bert_res = bertscore.compute(predictions=predictions_subset, 
+                                            references=[r[0] for r in references_subset], # Extract inner list for bertscore 
                                             lang='en',
-                                            batch_size=16) # Add batch_size for potentially better memory handling
+                                            batch_size=16)
                 logger.info("BERTScore computation finished.") 
                 metrics['bertscore_f1'] = float(np.mean(bert_res['f1']))
             except Exception as e:
                 logger.error(f"Error computing BERTScore on test: {e}")
+            
+            # --- Reference-based metrics (BLEU, METEOR, ROUGE) on FULL set ---
+            # These are usually less expensive, calculate on all samples
             try:
+                logger.info("Computing BLEU, METEOR, ROUGE on FULL test set...") 
                 bleu_result = evaluate.load('bleu').compute(predictions=all_predictions, references=all_references)
-                metrics['bleu'] = bleu_result['bleu']
+                metrics['bleu-1'] = bleu_result.get('precisions', [0.0] * 4)[0] # ADDED
+                metrics['bleu-2'] = bleu_result.get('precisions', [0.0] * 4)[1] # ADDED
+                metrics['bleu-3'] = bleu_result.get('precisions', [0.0] * 4)[2] # ADDED
+                metrics['bleu-4'] = bleu_result['bleu'] # Keep overall BLEU-4
                 meteor_result = evaluate.load('meteor').compute(predictions=all_predictions, references=all_references)
                 metrics['meteor'] = meteor_result['meteor']
                 rouge_result = evaluate.load('rouge').compute(predictions=all_predictions, references=all_references)
                 metrics['rougeL'] = rouge_result['rougeL']
             except Exception as e:
-                logger.error(f"Error calculating test metrics: {e}", exc_info=True)
-                metrics = {'bleu': 0.0, 'meteor': 0.0, 'rougeL': 0.0}
+                logger.error(f"Error calculating non-BERTScore test metrics: {e}", exc_info=True) # Updated log message
+                # Initialize all potentially calculated metrics to 0 on error
+                metrics.update({'bleu-1': 0.0, 'bleu-2': 0.0, 'bleu-3': 0.0, 'bleu-4': 0.0, 'meteor': 0.0, 'rougeL': 0.0})
+
+            # --- Diversity Metrics (Distinct-N & Self-BLEU) ---
+            try:
+                logger.info("Computing Diversity metrics (Distinct-N, Self-BLEU)...") # ADDED
+                metrics['distinct-1'] = calculate_distinct_n(predictions_subset, 1) # MODIFIED
+                metrics['distinct-2'] = calculate_distinct_n(predictions_subset, 2) # MODIFIED
+                metrics['self-bleu4'] = calculate_self_bleu(predictions_subset, n=4) # MODIFIED
+                logger.info("Diversity metrics computation finished.") # ADDED
+            except Exception as e:
+                 logger.error(f"Error calculating diversity metrics on test: {e}", exc_info=True) # ADDED
+                 metrics.update({'distinct-1': 0.0, 'distinct-2': 0.0, 'self-bleu4': 0.0}) # ADDED
+
         else:
             logger.warning("No predictions or references generated during testing, cannot compute metrics.")
-            metrics = {'bleu': 0.0, 'meteor': 0.0, 'rougeL': 0.0}
+            # Initialize all potentially calculated metrics to 0
+            metrics = {'bertscore_f1': 0.0, 'bleu-1': 0.0, 'bleu-2': 0.0, 'bleu-3': 0.0, 'bleu-4': 0.0, 'meteor': 0.0, 'rougeL': 0.0, 'distinct-1': 0.0, 'distinct-2': 0.0, 'self-bleu4': 0.0} # Updated init
 
         # --- Log Test Results --- 
         logger.info("--- Test Results --- ")
-        for name, score in metrics.items():
-            logger.info(f"Final Test {name.upper()}: {score:.4f}")
+        # Ensure consistent order for logging (optional but nice)
+        metric_order = ['bertscore_f1', 'bleu-1', 'bleu-2', 'bleu-3', 'bleu-4', 'meteor', 'rougeL', 'distinct-1', 'distinct-2', 'self-bleu4'] # Updated order
+        for name in metric_order:
+            if name in metrics:
+                 logger.info(f"Final Test {name.upper().replace('-', '_')}: {metrics[name]:.4f}") # Replaced '-' with '_' for better readability in logs
+            
             # Optionally log to TensorBoard (e.g., using a large step number like self.total_epochs + 1)
             # self.writer.add_scalar(f'Test/{name}', score, self.config['training']['epochs'] + 1)
         logger.info("--- Test Evaluation Finished --- ")
