@@ -891,10 +891,7 @@ class Trainer:
             try:
                 logger.info("Computing BLEU, METEOR, ROUGE on FULL test set...") 
                 bleu_result = evaluate.load('bleu').compute(predictions=all_predictions, references=all_references)
-                metrics['bleu-1'] = bleu_result.get('precisions', [0.0] * 4)[0] # ADDED
-                metrics['bleu-2'] = bleu_result.get('precisions', [0.0] * 4)[1] # ADDED
-                metrics['bleu-3'] = bleu_result.get('precisions', [0.0] * 4)[2] # ADDED
-                metrics['bleu-4'] = bleu_result['bleu'] # Keep overall BLEU-4
+                metrics['bleu-4'] = bleu_result['bleu'] # Overall BLEU-4
                 meteor_result = evaluate.load('meteor').compute(predictions=all_predictions, references=all_references)
                 metrics['meteor'] = meteor_result['meteor']
                 rouge_result = evaluate.load('rouge').compute(predictions=all_predictions, references=all_references)
@@ -902,7 +899,7 @@ class Trainer:
             except Exception as e:
                 logger.error(f"Error calculating non-BERTScore test metrics: {e}", exc_info=True) # Updated log message
                 # Initialize all potentially calculated metrics to 0 on error
-                metrics.update({'bleu-1': 0.0, 'bleu-2': 0.0, 'bleu-3': 0.0, 'bleu-4': 0.0, 'meteor': 0.0, 'rougeL': 0.0})
+                metrics.update({'bleu-4': 0.0, 'meteor': 0.0, 'rougeL': 0.0})
 
             # --- Diversity Metrics (Distinct-N & Self-BLEU) ---
             try:
@@ -918,15 +915,27 @@ class Trainer:
         else:
             logger.warning("No predictions or references generated during testing, cannot compute metrics.")
             # Initialize all potentially calculated metrics to 0
-            metrics = {'bertscore_f1': 0.0, 'bleu-1': 0.0, 'bleu-2': 0.0, 'bleu-3': 0.0, 'bleu-4': 0.0, 'meteor': 0.0, 'rougeL': 0.0, 'distinct-1': 0.0, 'distinct-2': 0.0, 'self-bleu4': 0.0} # Updated init
+            metrics = {'bertscore_f1': 0.0, 'bleu-4': 0.0, 'meteor': 0.0, 'rougeL': 0.0, 'distinct-1': 0.0, 'distinct-2': 0.0, 'self-bleu4': 0.0} # Updated init
 
         # --- Log Test Results --- 
         logger.info("--- Test Results --- ")
-        # Ensure consistent order for logging (optional but nice)
-        metric_order = ['bertscore_f1', 'bleu-1', 'bleu-2', 'bleu-3', 'bleu-4', 'meteor', 'rougeL', 'distinct-1', 'distinct-2', 'self-bleu4'] # Updated order
-        for name in metric_order:
-            if name in metrics:
-                 logger.info(f"Final Test {name.upper().replace('-', '_')}: {metrics[name]:.4f}") # Replaced '-' with '_' for better readability in logs
+        # Define the order and desired names for logging
+        # We use bleu-4 internally as it holds the overall score from evaluate.load('bleu')
+        metric_log_order = {
+            'bertscore_f1': 'BERTSCORE_F1',
+            'bleu-4': 'BLEU',  # Log bleu-4 as BLEU
+            'meteor': 'METEOR',
+            'rougeL': 'ROUGEL',
+            'distinct-1': 'DISTINCT_1',
+            'distinct-2': 'DISTINCT_2',
+            'self-bleu4': 'SELF_BLEU4'
+        }
+        
+        for internal_name, log_name in metric_log_order.items():
+            if internal_name in metrics:
+                logger.info(f"Final Test {log_name}: {metrics[internal_name]:.4f}")
+            else:
+                 logger.warning(f"Metric '{internal_name}' not found in results for logging.") # Added warning
             
             # Optionally log to TensorBoard (e.g., using a large step number like self.total_epochs + 1)
             # self.writer.add_scalar(f'Test/{name}', score, self.config['training']['epochs'] + 1)
