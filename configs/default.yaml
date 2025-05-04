@@ -59,8 +59,8 @@ training:
   betas_ae: [0.9, 0.999] # Different beta1 for AE often helps
 
   # WGAN-GP specific parameters
-  n_critic: 1           # Number of discriminator updates per generator update
-  lambda_gp: 10         # Gradient penalty coefficient
+  critic_iterations: 5           # Number of discriminator updates per generator update
+  gradient_penalty_lambda: 10    # Gradient penalty coefficient
   gradient_clip_val: 1.0 # Max norm for gradient clipping (Reduced for stability)
 
   # Loss weights (if combining losses)

@@ -84,6 +84,11 @@ class Trainer:
         self.output_dir = self.config.get('output_dir', 'results/latent_gan_run')
         os.makedirs(self.output_dir, exist_ok=True)
 
+        # --- WGAN-GP Specific Config ---
+        self.gradient_penalty_lambda = self.config['training'].get('gradient_penalty_lambda', 10.0)
+        self.critic_iterations = self.config['training'].get('critic_iterations', 5)
+        logger.info(f"WGAN-GP Config: Lambda={self.gradient_penalty_lambda}, Critic Iterations={self.critic_iterations}")
+
         self.device = get_device(self.config.get('training', {}).get('device', 'auto'))
         logger.info(f"Using device: {self.device}")
 
@@ -192,8 +197,9 @@ class Trainer:
         optimizer_config = self.config['training']
         lr_g = float(optimizer_config['lr_g']) # Cast to float
         lr_d = float(optimizer_config['lr_d']) # Cast to float
-        betas_g = tuple(optimizer_config['betas_g'])
-        betas_d = tuple(optimizer_config['betas_d'])
+        # WGAN-GP recommended betas
+        betas_g = tuple(optimizer_config.get('betas_g', [0.5, 0.999]))
+        betas_d = tuple(optimizer_config.get('betas_d', [0.5, 0.999]))
 
         self.optimizer_g = optim.Adam(self.generator.parameters(), lr=lr_g, betas=betas_g)
         self.optimizer_d = optim.Adam(self.discriminator.parameters(), lr=lr_d, betas=betas_d)
@@ -265,243 +271,162 @@ class Trainer:
         # Random weight term for interpolation between real and fake samples
         alpha = torch.rand(real_samples.size(0), 1, device=self.device)
         alpha = alpha.expand(real_samples.size())
-        
+
         # Get random interpolation between real and fake samples
         interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
-        d_interpolates = self.discriminator(interpolates)
-        
+
+        with autocast(self.device.type, enabled=self.use_amp):
+            d_interpolates = self.discriminator(interpolates)
+
         # Get gradient w.r.t. interpolates
         gradients = autograd.grad(
             outputs=d_interpolates,
             inputs=interpolates,
-            grad_outputs=torch.ones_like(d_interpolates, requires_grad=False),
-            create_graph=True,
-            retain_graph=True,
+            grad_outputs=torch.ones(d_interpolates.size(), device=self.device),
+            create_graph=True, # Create graph for second derivative calculation
+            retain_graph=True, # Retain graph for G pass
             only_inputs=True,
         )[0]
-        
+
         gradients = gradients.view(gradients.size(0), -1)
+        # Calculate the gradient penalty: (||grad(D(interpolates))||_2 - 1)^2
         gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
-        return gradient_penalty
+        return gradient_penalty * self.gradient_penalty_lambda
 
     def _train_epoch(self, epoch: int):
         """Runs a single training epoch for the WGAN-GP."""
         self.generator.train()
         self.discriminator.train()
-        # Encoder/Decoder mode for autoencoder training
-        if self.config['model']['encoder'].get('trainable', False):
-            self.encoder.train()
-        else:
-            self.encoder.eval()
-        if self.config['training'].get('lambda_reconstruction', 0) > 0:
-            self.decoder.train()
-        else:
-            self.decoder.eval()
-        # Track reconstruction loss
-        total_recon_loss = 0.0
+        self.encoder.train() # Keep encoder in train mode if used
 
-        total_d_loss = 0.0
-        total_g_loss = 0.0
-        total_gp = 0.0
-        batch_count = 0
+        epoch_start_time = time.time()
+        d_losses, g_losses, gp_losses = [], [], []
+        total_batches = len(self.train_loader)
+        progress_bar = tqdm(self.train_loader, desc=f"Epoch {epoch+1} Training", leave=False, unit='batch')
 
-        # Read gradient clipping value from config
-        gradient_clip_val = self.config['training'].get('gradient_clip_val', None)
+        for i, batch in enumerate(progress_bar):
+            # Move data to device
+            input_ids = batch['input_ids'].to(self.device)
+            attention_mask = batch['attention_mask'].to(self.device)
 
-        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}")
-        for batch_idx, real_texts in enumerate(pbar):
-            batch_size = len(real_texts)
-            batch_count += 1
-            
-            # Ensure models are on the correct device (redundant if initialized correctly, but safe)
-            self.discriminator.to(self.device)
-            self.generator.to(self.device)
-            self.encoder.to(self.device)
-
-            # Convert real texts to real latent vectors
-            with torch.no_grad(): # Encoder is frozen
-                real_latents = self.encoder(real_texts).detach()
-            real_latents = real_latents.to(self.device)
-
-            # === Train Discriminator (Critic) ===
+            # --------------------- #
+            #  Train Discriminator
+            # --------------------- #
             self.optimizer_d.zero_grad()
 
-            for _ in range(self.n_critic):
-                # Generate fake latent vectors
-                z = torch.randn(batch_size, self.noise_dim, device=self.device) # Use noise_dim
-                with torch.no_grad(): # Don't track gradients for G when training D
-                     fake_latents = self.generator(z).detach() 
-                
-                with autocast('cuda', enabled=self.use_amp): # New API
-                    # Get scores for real and fake latents
-                    real_scores = self.discriminator(real_latents)
-                    fake_scores = self.discriminator(fake_latents)
+            with autocast(self.device.type, enabled=self.use_amp):
+                # Encode real sentences to get real latent vectors
+                with torch.no_grad(): # Don't need gradients for encoder when training D
+                    real_latents = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+                    if isinstance(real_latents, tuple): # Handle potential tuple output from encoder
+                        real_latents = real_latents[0]
+                real_latents = real_latents.detach() # Detach from encoder graph
 
-                    # Gradient Penalty
-                    gradient_penalty = self._compute_gradient_penalty(real_latents.data, fake_latents.data)
+                # Generate fake latent vectors from noise
+                noise = torch.randn(input_ids.size(0), self.noise_dim, device=self.device)
+                # Detach fake latents so generator isn't updated here
+                fake_latents = self.generator(noise).detach()
 
-                    # Hinge GAN discriminator loss
-                    d_loss_real = F.relu(1.0 - real_scores).mean()
-                    d_loss_fake = F.relu(1.0 + fake_scores).mean()
-                    d_loss = d_loss_real + d_loss_fake + self.lambda_gp * gradient_penalty
+                # Get discriminator scores for real and fake latents
+                real_scores = self.discriminator(real_latents)
+                fake_scores = self.discriminator(fake_latents)
 
-                # Backward pass and optimization step for Discriminator
-                self.scaler.scale(d_loss / self.n_critic).backward() # Accumulate gradients
-                total_d_loss += d_loss.item() / self.n_critic
-                total_gp += gradient_penalty.item() / self.n_critic
+                # Calculate gradient penalty
+                gradient_penalty = self._compute_gradient_penalty(real_latents, fake_latents)
 
-            # Unscale gradients before clipping and stepping D
-            self.scaler.unscale_(self.optimizer_d)
-            if gradient_clip_val:
-                torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), gradient_clip_val)
+                # Calculate WGAN-GP discriminator loss
+                # Loss_D = E[D(fake)] - E[D(real)] + lambda * GP
+                d_loss = torch.mean(fake_scores) - torch.mean(real_scores) + gradient_penalty
+
+            # Scale loss, perform backward pass, and update discriminator weights
+            self.scaler.scale(d_loss).backward()
             self.scaler.step(self.optimizer_d)
-            self.scaler.update()
+            self.scaler.update() # Updates the scale for next iteration.
+
+            # Store losses for logging
+            d_losses.append(d_loss.item())
+            gp_losses.append(gradient_penalty.item())
+
+            # ----------------- #
+            #  Train Generator
+            # ----------------- #
+            # Train the generator only every `critic_iterations` steps
+            if (i + 1) % self.critic_iterations == 0:
+                self.optimizer_g.zero_grad()
+
+                with autocast(self.device.type, enabled=self.use_amp):
+                    # Generate fake latents (requires grad this time)
+                    noise = torch.randn(input_ids.size(0), self.noise_dim, device=self.device)
+                    fake_latents_g = self.generator(noise)
+
+                    # Get discriminator scores for fake latents
+                    fake_scores_g = self.discriminator(fake_latents_g)
+
+                    # Calculate WGAN generator loss
+                    # Loss_G = -E[D(fake)] (Maximize the critic's score for fake samples)
+                    g_loss = -torch.mean(fake_scores_g)
+
+                # Scale loss, perform backward pass, and update generator weights
+                self.scaler.scale(g_loss).backward()
+                self.scaler.step(self.optimizer_g)
+                self.scaler.update()
+
+                # Store generator loss
+                g_losses.append(g_loss.item())
+
+                # Step the generator's scheduler only when the generator is updated
+                if self.scheduler_g:
+                    self.scheduler_g.step()
+
+            # Step the discriminator's scheduler every step
             if self.scheduler_d:
                 self.scheduler_d.step()
-            self.optimizer_d.zero_grad() # Zero grad again just in case
 
-            # === Train Generator === 
-            # Only update generator every n_critic steps (effectively)
-            # But need to compute loss in each main loop iteration for logging?
-            # Let's update G every main loop iteration (simpler, common practice)
-            self.optimizer_g.zero_grad()
-
-            # Generate new fake latents (need gradients now)
-            z = torch.randn(batch_size, self.noise_dim, device=self.device) # Use noise_dim
-            fake_latents_for_g = self.generator(z)
-            
-            with autocast('cuda', enabled=self.use_amp): # New API
-                # Get discriminator score for fake latents
-                fake_scores_for_g = self.discriminator(fake_latents_for_g)
-                # Calculate Generator Loss (maximize D score for fakes -> minimize -D score)
-                g_loss = -fake_scores_for_g.mean()
-            
-            # Backward pass and optimization step for Generator
-            self.scaler.scale(g_loss).backward()
-            # Unscale gradients before clipping and stepping G
-            self.scaler.unscale_(self.optimizer_g)
-            if gradient_clip_val:
-                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), gradient_clip_val)
-            self.scaler.step(self.optimizer_g)
-            self.scaler.update()
-            if self.scheduler_g:
-                self.scheduler_g.step()
-            total_g_loss += g_loss.item()
-
-            # === Autoencoder reconstruction step ===
-            lambda_recon = self.config['training'].get('lambda_reconstruction', 0.0)
-            if lambda_recon > 0:
-                self.optimizer_ae.zero_grad()
-                encoding = self.tokenizer(
-                    real_texts,
-                    padding='max_length',
-                    truncation=True,
-                    max_length=self.config['data'].get('max_seq_length'),
-                    return_tensors='pt'
-                ).to(self.device)
-                input_ids = encoding.input_ids
-                decoder_input = input_ids[:, :-1]
-                decoder_target = input_ids[:, 1:]
-                with autocast('cuda', enabled=self.use_amp):
-                    latents_recon = self.encoder(real_texts)
-                    logits = self.decoder(latents_recon, decoder_input)
-                    loss_recon = self.criterion_recon(
-                        logits.reshape(-1, self.vocab_size), decoder_target.reshape(-1)
-                    )
-                    loss_recon = lambda_recon * loss_recon
-                self.scaler.scale(loss_recon).backward()
-                # Unscale gradients before clipping and stepping AE
-                self.scaler.unscale_(self.optimizer_ae)
-                if gradient_clip_val:
-                    # Clip combined Encoder + Decoder params
-                    torch.nn.utils.clip_grad_norm_(list(self.encoder.parameters()) + list(self.decoder.parameters()), gradient_clip_val)
-                self.scaler.step(self.optimizer_ae)
-                self.scaler.update()
-                if self.scheduler_ae:
-                    self.scheduler_ae.step()
-                total_recon_loss += loss_recon.item()
-
-            # --- Logging --- 
+            # --- Logging & Progress Bar --- 
             self.global_step += 1
-            if batch_idx % 50 == 0: # Log every 50 steps
-                 pbar.set_postfix({
-                     'D Loss': f'{d_loss.item():.4f}',
-                     'G Loss': f'{g_loss.item():.4f}',
-                     'GP': f'{gradient_penalty.item():.4f}',
-                     'Recon Loss': f'{loss_recon.item():.4f}' if lambda_recon > 0 else 'N/A'
-                 })
-            if self.writer:
-                self.writer.add_scalar('train/D_loss_step', d_loss.item(), self.global_step)
-                self.writer.add_scalar('train/G_loss_step', g_loss.item(), self.global_step)
-                self.writer.add_scalar('train/GP_step', gradient_penalty.item(), self.global_step)
-                if lambda_recon > 0:
-                    self.writer.add_scalar('train/Reconstruction_loss_step', loss_recon.item(), self.global_step)
-            # TODO: Add Tensorboard logging if desired
-
-        avg_d_loss = total_d_loss / batch_count
-        avg_g_loss = total_g_loss / batch_count
-        avg_gp = total_gp / batch_count
-        avg_recon_loss = total_recon_loss / batch_count if batch_count else 0.0
-        logger.info(f"Epoch {epoch+1} finished. Avg D Loss: {avg_d_loss:.4f}, Avg G Loss: {avg_g_loss:.4f}, Avg GP: {avg_gp:.4f}, Avg Recon Loss: {avg_recon_loss:.4f}")
-        if self.writer:
-            self.writer.add_scalar('train/D_loss_epoch', avg_d_loss, epoch)
-            self.writer.add_scalar('train/G_loss_epoch', avg_g_loss, epoch)
-            self.writer.add_scalar('train/GP_epoch', avg_gp, epoch)
-            self.writer.add_scalar('train/Reconstruction_loss_epoch', avg_recon_loss, epoch)
-
-        # Store losses for summary
-        self.last_epoch_losses = {'D_Loss': avg_d_loss, 'G_Loss': avg_g_loss, 'GP': avg_gp, 'Recon_Loss': avg_recon_loss}
-
-    def _pretrain_ae_epoch(self, epoch: int):
-        """Pretrain Autoencoder (encoder+decoder) with MLE for warm-start."""
-        self.encoder.train()
-        self.decoder.train()
-        total_loss = 0.0
-        batch_count = 0
-        pbar = tqdm(self.train_loader, desc=f"Pretrain AE Epoch {epoch+1}")
-        for batch_idx, real_texts in enumerate(pbar):
-            batch_count += 1
-            encoding = self.tokenizer(
-                real_texts,
-                padding='max_length', truncation=True,
-                max_length=self.config['data'].get('max_seq_length'),
-                return_tensors='pt'
-            ).to(self.device)
-            input_ids = encoding.input_ids
-            decoder_input = input_ids[:, :-1]
-            decoder_target = input_ids[:, 1:]
-            with autocast('cuda', enabled=self.use_amp):
-                latents = self.encoder(real_texts)
-                logits = self.decoder(latents, decoder_input)
-                loss = self.criterion_recon(
-                    logits.reshape(-1, self.vocab_size), decoder_target.reshape(-1)
-                ) * self.config['training'].get('lambda_reconstruction', 1.0)
-            self.optimizer_ae.zero_grad()
-            self.scaler.scale(loss).backward()
+            current_lr_g = self.optimizer_g.param_groups[0]['lr']
+            current_lr_d = self.optimizer_d.param_groups[0]['lr']
             
-            # Get gradient clipping value from config
-            gradient_clip_val = self.config['training'].get('gradient_clip_val', None)
-            
-            # Unscale gradients before clipping and stepping
-            self.scaler.unscale_(self.optimizer_ae)
-            if gradient_clip_val:
-                # Clip combined Encoder + Decoder params
-                torch.nn.utils.clip_grad_norm_(list(self.encoder.parameters()) + list(self.decoder.parameters()), gradient_clip_val)
+            log_dict = {
+                'D_Loss': f"{d_loss.item():.4f}",
+                'GP': f"{gradient_penalty.item():.4f}",
+                'LR_D': f"{current_lr_d:.2e}",
+                'LR_G': f"{current_lr_g:.2e}"
+            }
+            # Only add G_Loss to log if it was calculated in this step
+            if (i + 1) % self.critic_iterations == 0 and g_losses:
+                log_dict['G_Loss'] = f"{g_losses[-1]:.4f}"
+            else: # Keep placeholder if G wasn't trained or list is empty
+                log_dict['G_Loss'] = "N/A"
                 
-            self.scaler.step(self.optimizer_ae)
-            self.scaler.update()
-            if self.scheduler_ae:
-                self.scheduler_ae.step()
-            total_loss += loss.item()
-            if self.writer and batch_idx % 50 == 0:
-                self.writer.add_scalar('pretrain_ae/loss_step', loss.item(), self.global_step)
-            self.global_step += 1
-            pbar.set_postfix({'AE Loss': f'{loss.item():.4f}'})
-        avg_loss = total_loss / batch_count if batch_count else 0.0
-        logger.info(f"Pretrain AE Epoch {epoch+1} finished. Avg AE Loss: {avg_loss:.4f}")
+            progress_bar.set_postfix(log_dict)
+            
+            # Log to TensorBoard periodically
+            if self.writer and self.global_step % self.config['training'].get('log_interval', 50) == 0:
+                self.writer.add_scalar('Loss/Discriminator', d_loss.item(), self.global_step)
+                self.writer.add_scalar('Loss/Gradient_Penalty', gradient_penalty.item(), self.global_step)
+                self.writer.add_scalar('LR/Discriminator', current_lr_d, self.global_step)
+                self.writer.add_scalar('LR/Generator', current_lr_g, self.global_step)
+                # Log G loss only when it's computed
+                if (i + 1) % self.critic_iterations == 0 and g_losses:
+                    self.writer.add_scalar('Loss/Generator', g_losses[-1], self.global_step)
+                    
+        # --- End of Epoch Summary --- 
+        epoch_end_time = time.time()
+        avg_d_loss = sum(d_losses) / len(d_losses) if d_losses else 0
+        avg_g_loss = sum(g_losses) / len(g_losses) if g_losses else 0 # Avg only over steps where G was trained
+        avg_gp = sum(gp_losses) / len(gp_losses) if gp_losses else 0
+
+        logger.info(f"Epoch {epoch+1} Summary | Time: {epoch_end_time - epoch_start_time:.2f}s | Avg D Loss: {avg_d_loss:.4f} | Avg G Loss: {avg_g_loss:.4f} | Avg GP: {avg_gp:.4f}")
+        
+        # Store last epoch losses for checkpoint saving
+        self.last_epoch_losses = {'D_Loss': avg_d_loss, 'G_Loss': avg_g_loss, 'GP': avg_gp}
+
+        # Log epoch averages to TensorBoard
         if self.writer:
-            self.writer.add_scalar('pretrain_ae/loss_epoch', avg_loss, epoch)
-        self.last_epoch_losses['AE_Loss'] = avg_loss
+            self.writer.add_scalar('Epoch_Loss/Discriminator', avg_d_loss, epoch + 1)
+            self.writer.add_scalar('Epoch_Loss/Generator', avg_g_loss, epoch + 1)
+            self.writer.add_scalar('Epoch_Loss/Gradient_Penalty', avg_gp, epoch + 1)
 
     def _evaluate(self, epoch: int):
         """Evaluate the model on the validation set, compute metrics, and track the best model."""
